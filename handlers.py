@@ -1,3 +1,4 @@
+
 import asyncio
 import csv
 import io
@@ -14,8 +15,6 @@ from database import get_pool
 
 logger = logging.getLogger(__name__)
 
-# Reply to a message containing these custom emojis with /setpremiumemojis.
-# The first custom emoji is assigned to rocket, the second to broadcast, etc.
 EMOJI_KEYS = [
     ("rocket", "🚀"), ("broadcast", "📣"), ("calendar", "🗓"),
     ("destination", "📡"), ("stats", "📊"), ("help", "❔"),
@@ -25,16 +24,11 @@ EMOJI_KEYS = [
     ("sparkle", "✨"), ("settings", "⚙️"), ("chart", "📈"),
 ]
 PAGE_SIZE = 6
-
-# Cached custom emoji IDs are used in message text and inline-button icons.
 PREMIUM_EMOJI_CACHE: dict[str, str] = {}
 
 
 def premium_button(text: str, callback_data: str | None = None, url: str | None = None, **kwargs):
-    """Build clean-label buttons and use only the matching configured custom-emoji icon."""
     label = str(text)
-    # Remove ordinary emoji/decorative glyphs from button labels. Icons are supplied
-    # separately through Telegram's custom-emoji button icon field.
     for _, fallback in sorted(EMOJI_KEYS, key=lambda item: len(item[1]), reverse=True):
         label = label.replace(fallback, "")
     for decorative in (
@@ -43,7 +37,7 @@ def premium_button(text: str, callback_data: str | None = None, url: str | None 
         "•", "☑", "▫"
     ):
         label = label.replace(decorative, "")
-    label = re.sub(r"\\s+", " ", label).strip() or "Open"
+    label = re.sub(r"\s+", " ", label).strip() or "Open"
 
     lower = label.lower()
     if "schedule" in lower or "custom date" in lower or any(x in lower for x in ("hour", "tomorrow")):
@@ -102,7 +96,6 @@ async def save_user(user) -> None:
 
 
 async def refresh_premium_emoji_cache(application_or_context) -> dict[str, str]:
-    """Reload saved custom-emoji IDs; accepts either Application or callback context."""
     application = (
         application_or_context
         if isinstance(application_or_context, Application)
@@ -118,12 +111,10 @@ async def refresh_premium_emoji_cache(application_or_context) -> dict[str, str]:
 
 
 def premiumize(text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Render configured custom emojis in bot-authored HTML text, with Unicode fallback."""
     mapping = context.application.bot_data.get("premium_emoji_map", {})
     replacements = [(fallback, mapping.get(key), key) for key, fallback in EMOJI_KEYS if mapping.get(key)]
     if not replacements:
         return text
-    # Longest first avoids replacing a shorter emoji prefix in a compound emoji.
     replacements.sort(key=lambda item: len(item[0]), reverse=True)
     pattern = re.compile("|".join(re.escape(item[0]) for item in replacements))
     lookup = {fallback: (emoji_id, key) for fallback, emoji_id, key in replacements}
@@ -258,6 +249,7 @@ async def register_destination(update: Update, context: ContextTypes.DEFAULT_TYP
         await reply_html(message, "ℹ️ Run /register inside the group or channel you want to register.", context)
         return
     try:
+
         member = await context.bot.get_chat_member(chat.id, user.id)
         if member.status not in ("administrator", "creator"):
             await reply_html(message, "⛔ Only a current group/channel administrator can register this destination.", context)
@@ -273,7 +265,6 @@ async def register_destination(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     async with get_pool().acquire() as conn:
-        # Preserve original owner_id for compatibility, but do not block other verified admins.
         await conn.execute(
             """INSERT INTO destinations(chat_id,owner_id,chat_title,chat_type,is_active)
                VALUES($1,$2,$3,$4,TRUE) ON CONFLICT(chat_id) DO UPDATE SET
@@ -378,7 +369,6 @@ async def destinations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def owned_targets(user_id: int, bot=None) -> list[int]:
-    """Return destinations this user can still administer in Telegram right now."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             "SELECT DISTINCT d.chat_id FROM destinations d LEFT JOIN destination_access da ON da.chat_id=d.chat_id WHERE (d.owner_id=$1 OR da.user_id=$1) AND d.is_active=TRUE ORDER BY d.chat_id",
@@ -397,7 +387,6 @@ async def owned_targets(user_id: int, bot=None) -> list[int]:
                 async with get_pool().acquire() as conn:
                     await conn.execute("DELETE FROM destination_access WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
         except TelegramError:
-            # If Telegram cannot verify access, fail closed rather than allowing stale access.
             async with get_pool().acquire() as conn:
                 await conn.execute("DELETE FROM destination_access WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
     return allowed
@@ -426,11 +415,9 @@ async def queue_owned_campaign(user_id: int, draft: dict, when: datetime, repeat
 
 
 async def get_user_destination_rows(user_id: int, bot) -> list[dict]:
-    """Return destinations the user can currently manage, including public usernames."""
     target_ids = await owned_targets(user_id, bot)
     if not target_ids:
         return []
-
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             """SELECT d.chat_id, d.chat_title, d.chat_type, d.is_active
@@ -443,7 +430,6 @@ async def get_user_destination_rows(user_id: int, bot) -> list[dict]:
                ORDER BY LOWER(d.chat_title), d.chat_id""",
             target_ids, user_id,
         )
-
     result = []
     for row in rows:
         item = dict(row)
@@ -453,14 +439,12 @@ async def get_user_destination_rows(user_id: int, bot) -> list[dict]:
             item["username"] = getattr(chat, "username", None)
             item["chat_title"] = getattr(chat, "title", None) or row["chat_title"]
         except TelegramError:
-            # Retain the registered entry if Telegram can't return current metadata.
             pass
         result.append(item)
     return result
 
 
 async def render_user_destination_picker(query, context, page: int = 0) -> None:
-    """Render a paginated multi-select destination picker for user broadcasts."""
     user = query.from_user
     destinations_list = await get_user_destination_rows(user.id, context.bot)
     if not destinations_list:
@@ -483,7 +467,6 @@ async def render_user_destination_picker(query, context, page: int = 0) -> None:
     selected = {int(value) for value in context.user_data.get("user_target_selection", [])}
     selected_count = sum(1 for item in destinations_list if int(item["chat_id"]) in selected)
     page_rows = destinations_list[page * page_size:(page + 1) * page_size]
-
     lines = [
         "<b>YOUR DESTINATIONS</b>",
         "Choose one or more groups/channels below.",
@@ -498,24 +481,19 @@ async def render_user_destination_picker(query, context, page: int = 0) -> None:
         kind = str(row["chat_type"] or "destination").replace("supergroup", "group").title()
         mark = "[SELECTED]" if chat_id in selected else "[ ]"
         identity = f"@{username}" if username else "Private / no username"
-        label = f"{mark} {title} · @{username}" if username else f"{mark} {title} · Private"
-        keyboard.append([premium_button(label[:60], callback_data=f"u:targettoggle:{chat_id}:{page}")])
-        lines.append(f"\n• <b>{escape_html(title)}</b>\n  {escape_html(kind)} · {escape_html(identity)}")
-
+        keyboard.append([premium_button(f"{mark} {title[:35]} · {kind}", callback_data=f"u:target:{chat_id}:{page}")])
+        lines.append(f"\n• <b>{escape_html(title)}</b>\n  {escape_html(identity)} · <code>{chat_id}</code>")
     navigation = []
     if page > 0:
-        navigation.append(premium_button("⬅️ Previous", callback_data=f"u:targetpage:{page - 1}"))
+        navigation.append(premium_button("⬅️ Previous", callback_data=f"u:targets:{page-1}"))
     if page + 1 < total_pages:
-        navigation.append(premium_button("Next ➡️", callback_data=f"u:targetpage:{page + 1}"))
+        navigation.append(premium_button("Next ➡️", callback_data=f"u:targets:{page+1}"))
     if navigation:
         keyboard.append(navigation)
-    keyboard.extend([
-        [premium_button("🌐 All destinations", callback_data="u:targetall")],
-        [premium_button("✅ Review selected", callback_data="u:targetdone")],
-        [premium_button("🔄 Refresh", callback_data="u:destinations"), premium_button("✖️ Cancel", callback_data="u:targetcancel")],
-    ])
+    keyboard.append([premium_button("☑️ Select All", callback_data=f"u:targetsall:{page}")])
+    keyboard.append([premium_button("📣 Continue", callback_data="u:targetconfirm")])
+    keyboard.append([premium_button("⬅️ Back", callback_data="u:draft"), premium_button("🏠 Menu", callback_data="u:home")])
     await edit_html(query, "\n".join(lines), context, InlineKeyboardMarkup(keyboard))
-
 
 async def render_user_broadcast_confirmation(query, context) -> None:
     """Review the selected destinations before a campaign is queued."""
@@ -549,7 +527,6 @@ async def render_user_broadcast_confirmation(query, context) -> None:
         )
         return
 
-    # Revalidate access before displaying a confirmation.
     allowed = set(await owned_targets(user.id, context.bot))
     selected = [chat_id for chat_id in selected if chat_id in allowed]
     if not selected:
@@ -869,7 +846,6 @@ async def prepare_admin_confirmation(query, context: ContextTypes.DEFAULT_TYPE, 
     await edit_html(query, f"<b>Review admin campaign</b>\n\nAudience: <b>{escape_html(scope.title())}</b>\nRecipients: <b>{len(targets):,}</b>\n\nNo messages have been sent yet. Confirm only if this audience is correct.", context,
         InlineKeyboardMarkup([[premium_button("✅ Confirm & Queue", callback_data="a:confirm"), premium_button("✖️ Cancel", callback_data="a:cancel")], [premium_button("🛡 Admin Menu", callback_data="a:home")]]))
 
-
 async def user_report_rows(offset: int | None = None, limit: int | None = None):
     base = """WITH campaign_stats AS (
                  SELECT owner_id, COUNT(*) AS total_broadcasts FROM campaigns GROUP BY owner_id
@@ -900,6 +876,7 @@ async def render_admin_stats(query, context: ContextTypes.DEFAULT_TYPE, page: in
         running = int(await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='running'") or 0)
         completed = int(await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='completed'") or 0)
         failed_campaigns = int(await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='failed'") or 0)
+
     total_pages = max(1, (total_users + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     rows = await user_report_rows(page * PAGE_SIZE, PAGE_SIZE)
@@ -930,7 +907,11 @@ async def render_admin_stats(query, context: ContextTypes.DEFAULT_TYPE, page: in
     nav.append(premium_button(f"{page+1}/{total_pages}", callback_data=f"a:stats:{page}"))
     if page + 1 < total_pages:
         nav.append(premium_button("Next ➡️", callback_data=f"a:stats:{page+1}"))
-    keyboard = [nav, [premium_button("📥 Export all users (CSV)", callback_data="a:exportusers")], [premium_button("⬅️ Admin Dashboard", callback_data="a:home")]]
+    keyboard = [
+        nav,
+        [premium_button("📥 Export all users (CSV)", callback_data="a:exportusers")],
+        [premium_button("⬅️ Admin Dashboard", callback_data="a:home")],
+    ]
     await edit_html(query, "\n".join(lines), context, InlineKeyboardMarkup(keyboard))
 
 
@@ -938,12 +919,24 @@ async def export_users_csv(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = await user_report_rows()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["user_id", "name", "username", "total_broadcasts", "successful_deliveries", "failed_deliveries", "joined_date_utc", "last_active_utc"])
+    writer.writerow([
+        "user_id", "name", "username", "total_broadcasts",
+        "successful_deliveries", "failed_deliveries",
+        "joined_date_utc", "last_active_utc",
+    ])
     for row in rows:
-        writer.writerow([row["user_id"], row["first_name"], row["username"] or "", row["total_broadcasts"], row["successful"], row["failed"], row["created_at"].isoformat() if row["created_at"] else "", row["last_seen_at"].isoformat() if row["last_seen_at"] else ""])
+        writer.writerow([
+            row["user_id"], row["first_name"], row["username"] or "",
+            row["total_broadcasts"], row["successful"], row["failed"],
+            row["created_at"].isoformat() if row["created_at"] else "",
+            row["last_seen_at"].isoformat() if row["last_seen_at"] else "",
+        ])
     payload = io.BytesIO(output.getvalue().encode("utf-8-sig"))
     payload.name = "telegram_broadcast_pro_users.csv"
-    await query.message.reply_document(document=InputFile(payload, filename=payload.name), caption="Complete user activity report exported by Telegram Broadcast Pro.")
+    await query.message.reply_document(
+        document=InputFile(payload, filename=payload.name),
+        caption="Complete user activity report exported by Telegram Broadcast Pro.",
+    )
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -954,10 +947,14 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_admin(user.id):
         await reply_html(message, "⛔ Authorized administrators only.", context)
         return
-    # Open the report directly: overview plus the first page of registered-user details.
     text = await build_stats_text(0, context)
     keyboard = await stats_keyboard(0)
-    await message.reply_text(premiumize(text, context), parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+    await message.reply_text(
+        premiumize(text, context),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 async def build_stats_text(page: int, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -969,15 +966,18 @@ async def build_stats_text(page: int, context: ContextTypes.DEFAULT_TYPE) -> str
         running = int(await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='running'") or 0)
         completed = int(await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='completed'") or 0)
         failed_campaigns = int(await conn.fetchval("SELECT COUNT(*) FROM campaigns WHERE status='failed'") or 0)
+
     total_pages = max(1, (total_users + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     rows = await user_report_rows(page * PAGE_SIZE, PAGE_SIZE)
-    lines = ["<b>SYSTEM STATS · USER REPORT</b>",
-             f"Users: <b>{total_users:,}</b> · Active destinations: <b>{destinations_count:,}</b>",
-             f"Campaigns: <b>{campaign_count:,}</b> · Scheduled: <b>{scheduled:,}</b> · Running: <b>{running:,}</b>",
-             f"Completed: <b>{completed:,}</b> · Failed campaigns: <b>{failed_campaigns:,}</b>",
-             f"\n<b>ALL USERS · Page {page+1}/{total_pages}</b>",
-             "<i>Successful/failed count delivery attempts recorded across each user's campaigns.</i>"]
+    lines = [
+        "<b>SYSTEM STATS · USER REPORT</b>",
+        f"Users: <b>{total_users:,}</b> · Active destinations: <b>{destinations_count:,}</b>",
+        f"Campaigns: <b>{campaign_count:,}</b> · Scheduled: <b>{scheduled:,}</b> · Running: <b>{running:,}</b>",
+        f"Completed: <b>{completed:,}</b> · Failed campaigns: <b>{failed_campaigns:,}</b>",
+        f"\n<b>ALL USERS · Page {page+1}/{total_pages}</b>",
+        "<i>Successful/failed count delivery attempts recorded across each user's campaigns.</i>",
+    ]
     if not rows:
         lines.append("\nNo registered users yet.")
     for row in rows:
@@ -985,7 +985,12 @@ async def build_stats_text(page: int, context: ContextTypes.DEFAULT_TYPE) -> str
         username = f"@{escape_html(row['username'])}" if row["username"] else "(no username)"
         joined = row["created_at"].strftime("%Y-%m-%d") if row["created_at"] else "—"
         last_active = row["last_seen_at"].strftime("%Y-%m-%d %H:%M UTC") if row["last_seen_at"] else "—"
-        lines.append(f"\n<b>{name}</b> · {username}\nID: <code>{row['user_id']}</code>\nBroadcasts: <b>{row['total_broadcasts']}</b> · Successful: <b>{row['successful']}</b> · Failed: <b>{row['failed']}</b>\nJoined: {joined} · Last active: {last_active}")
+        lines.append(
+            f"\n<b>{name}</b> · {username}\n"
+            f"ID: <code>{row['user_id']}</code>\n"
+            f"Broadcasts: <b>{row['total_broadcasts']}</b> · Successful: <b>{row['successful']}</b> · Failed: <b>{row['failed']}</b>\n"
+            f"Joined: {joined} · Last active: {last_active}"
+        )
     return "\n".join(lines)
 
 
@@ -1000,7 +1005,11 @@ async def stats_keyboard(page: int) -> InlineKeyboardMarkup:
     nav.append(premium_button(f"{page+1}/{total_pages}", callback_data=f"a:stats:{page}"))
     if page + 1 < total_pages:
         nav.append(premium_button("Next ➡️", callback_data=f"a:stats:{page+1}"))
-    return InlineKeyboardMarkup([nav, [premium_button("📥 Export all users (CSV)", callback_data="a:exportusers")], [premium_button("⬅️ Admin Dashboard", callback_data="a:home")]])
+    return InlineKeyboardMarkup([
+        nav,
+        [premium_button("📥 Export all users (CSV)", callback_data="a:exportusers")],
+        [premium_button("⬅️ Admin Dashboard", callback_data="a:home")],
+    ])
 
 
 async def set_premium_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1012,20 +1021,43 @@ async def set_premium_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     source = message.reply_to_message
     if not source:
-        await reply_html(message, "Reply to a message containing your Telegram Premium custom emojis with /setpremiumemojis. The first custom emoji maps to Rocket, the second to Broadcast, and so on.", context, reply_markup=admin_menu())
+        await reply_html(
+            message,
+            "Reply to a message containing your Telegram Premium custom emojis with /setpremiumemojis. The first custom emoji maps to Rocket, the second to Broadcast, and so on.",
+            context,
+            reply_markup=admin_menu(),
+        )
         return
     entities = list(source.entities or []) + list(source.caption_entities or [])
-    custom = sorted((entity for entity in entities if entity.type == MessageEntity.CUSTOM_EMOJI and entity.custom_emoji_id), key=lambda item: item.offset)
+    custom = sorted(
+        (
+            entity for entity in entities
+            if entity.type == MessageEntity.CUSTOM_EMOJI and entity.custom_emoji_id
+        ),
+        key=lambda item: item.offset,
+    )
     if not custom:
-        await reply_html(message, "No Telegram custom-emoji entities were found in the replied-to message. Send a message containing actual custom emojis, then reply to it with /setpremiumemojis.", context)
+        await reply_html(
+            message,
+            "No Telegram custom-emoji entities were found in the replied-to message. Send a message containing actual custom emojis, then reply to it with /setpremiumemojis.",
+            context,
+        )
         return
     chosen = custom[:len(EMOJI_KEYS)]
     async with get_pool().acquire() as conn:
         await conn.execute("DELETE FROM premium_emojis")
         for (key, fallback), entity in zip(EMOJI_KEYS, chosen):
-            await conn.execute("INSERT INTO premium_emojis(emoji_key,custom_emoji_id) VALUES($1,$2) ON CONFLICT(emoji_key) DO UPDATE SET custom_emoji_id=EXCLUDED.custom_emoji_id", key, entity.custom_emoji_id)
+            await conn.execute(
+                "INSERT INTO premium_emojis(emoji_key,custom_emoji_id) VALUES($1,$2) "
+                "ON CONFLICT(emoji_key) DO UPDATE SET custom_emoji_id=EXCLUDED.custom_emoji_id",
+                key,
+                entity.custom_emoji_id,
+            )
     mapping = await refresh_premium_emoji_cache(context)
-    assigned = [f"{index}. {key.replace('_', ' ').title()}" for index, (key, _) in enumerate(EMOJI_KEYS[:len(mapping)], start=1)]
+    assigned = [
+        f"{index}. {key.replace('_', ' ').title()}"
+        for index, (key, _) in enumerate(EMOJI_KEYS[:len(mapping)], start=1)
+    ]
     await reply_html(
         message,
         "<b>PREMIUM BUTTON STYLE SAVED</b>\n\n"
@@ -1049,58 +1081,121 @@ async def reset_premium_emojis(update: Update, context: ContextTypes.DEFAULT_TYP
     async with get_pool().acquire() as conn:
         await conn.execute("DELETE FROM premium_emojis")
     context.application.bot_data["premium_emoji_map"] = {}
-    await reply_html(message, "Premium emoji overrides removed. Button labels remain clean text until you configure custom emoji icons again.", context, reply_markup=admin_menu())
-
+    await reply_html(
+        message,
+        "Premium emoji overrides removed. Button labels remain clean text until you configure custom emoji icons again.",
+        context,
+        reply_markup=admin_menu(),
+    )
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     if not query or not user:
         return
+
     await query.answer()
     await save_user(user)
     data = query.data or ""
     admin_action = data.startswith("a:")
+
     if admin_action and not is_admin(user.id):
         await query.answer("Administrator access required.", show_alert=True)
         return
 
     if data in {"u:home", "a:home"}:
         admin_view = data == "a:home"
-        text = "<b>ADMIN DASHBOARD</b>\nChoose an administrator tool." if admin_view else "<b>MAIN DASHBOARD</b>\nSend your broadcast content to me in this private chat, or choose a feature below."
-        await edit_html(query, text, context, admin_menu() if admin_view else user_menu())
+        text = (
+            "<b>ADMIN DASHBOARD</b>\nChoose an administrator tool."
+            if admin_view
+            else "<b>MAIN DASHBOARD</b>\nSend your broadcast content to me in this private chat, or choose a feature below."
+        )
+        await edit_html(
+            query, text, context,
+            admin_menu() if admin_view else user_menu()
+        )
         return
+
     if data == "u:help":
         await edit_html(query, USER_HELP, context, user_menu())
         return
+
     if data == "a:help":
         await edit_html(query, ADMIN_HELP, context, admin_menu())
         return
+
     if data == "u:broadcast":
-        await edit_html(query, "<b>NEW BROADCAST</b>\n\nSend your broadcast content to this bot in a private chat — text, photo, video or supported media. I'll show buttons to send it now or schedule it for later.\n\nYou can also reply to a source message with /broadcast.", context, back_button())
+        await edit_html(
+            query,
+            "<b>NEW BROADCAST</b>\n\n"
+            "Send your broadcast content to this bot in a private chat — "
+            "text, photo, video or supported media. I'll show buttons to send "
+            "it now or schedule it for later.\n\n"
+            "You can also reply to a source message with /broadcast.",
+            context,
+            back_button(),
+        )
         return
+
     if data == "u:schedule":
         if not context.user_data.get("broadcast_draft"):
-            await edit_html(query, "<b>ADVANCED SCHEDULER</b>\n\nFirst send the message, photo, video or other content you want to broadcast to this bot in private chat. Once the draft is received, tap Schedule to choose a delivery time, recurring interval, or custom UTC date/time.", context,
-                            InlineKeyboardMarkup([[premium_button("📣 New Broadcast", callback_data="u:broadcast")], [premium_button("⬅️ Main Menu", callback_data="u:home")]]))
+            await edit_html(
+                query,
+                "<b>ADVANCED SCHEDULER</b>\n\n"
+                "First send the message, photo, video or other content you want "
+                "to broadcast to this bot in private chat. Once the draft is "
+                "received, tap Schedule to choose a delivery time, recurring "
+                "interval, or custom UTC date/time.",
+                context,
+                InlineKeyboardMarkup([
+                    [premium_button("📣 New Broadcast", callback_data="u:broadcast")],
+                    [premium_button("⬅️ Main Menu", callback_data="u:home")],
+                ]),
+            )
         else:
-            await edit_html(query, "<b>ADVANCED SCHEDULER</b>\n\nChoose a quick time or recurring schedule. All times use UTC. For a custom time, enter <code>YYYY-MM-DD HH:MM</code> and optionally repeat interval in minutes.", context, schedule_menu())
+            await edit_html(
+                query,
+                "<b>ADVANCED SCHEDULER</b>\n\n"
+                "Choose a quick time or recurring schedule. All times use UTC. "
+                "For a custom time, enter <code>YYYY-MM-DD HH:MM</code> and "
+                "optionally repeat interval in minutes.",
+                context,
+                schedule_menu(),
+            )
         return
+
     if data == "u:draft":
         if not context.user_data.get("broadcast_draft"):
-            await edit_html(query, "No draft is active. Send your content here first.", context, user_menu())
+            await edit_html(
+                query, "No draft is active. Send your content here first.",
+                context, user_menu()
+            )
         else:
-            await edit_html(query, "<b>DRAFT READY</b>\nChoose Send Now or Schedule.", context, draft_menu())
+            await edit_html(
+                query, "<b>DRAFT READY</b>\nChoose Send Now or Schedule.",
+                context, draft_menu()
+            )
         return
+
     if data == "u:sendnow":
         draft = context.user_data.get("broadcast_draft")
         if not draft:
-            await edit_html(query, "No draft found. Send your content to the bot first.", context, user_menu())
+            await edit_html(
+                query,
+                "No draft found. Send your content to the bot first.",
+                context, user_menu()
+            )
             return
+
         targets = await owned_targets(user.id, context.bot)
         if not targets:
-            await edit_html(query, "No active destinations found. Register a group or channel first.", context, user_menu())
+            await edit_html(
+                query,
+                "No active destinations found. Register a group or channel first.",
+                context, user_menu()
+            )
             return
+
         context.user_data["user_target_selection"] = []
         await render_user_destination_picker(query, context, page=0)
         return
@@ -1108,6 +1203,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "u:confirmnow":
         draft = context.user_data.get("confirm_user_campaign")
         selected = context.user_data.get("confirm_user_target_ids", [])
+
         if not draft or not selected:
             await edit_html(
                 query,
@@ -1121,15 +1217,27 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         currently_allowed = set(await owned_targets(user.id, context.bot))
-        targets = sorted(set(int(value) for value in selected).intersection(currently_allowed))
+        targets = sorted(
+            set(int(value) for value in selected).intersection(currently_allowed)
+        )
+
         if not targets:
             context.user_data.pop("confirm_user_campaign", None)
             context.user_data.pop("confirm_user_target_ids", None)
             context.user_data.pop("user_target_selection", None)
-            await edit_html(query, "You no longer have administrator access to the selected destinations. Please select them again.", context, user_menu())
+            await edit_html(
+                query,
+                "You no longer have administrator access to the selected destinations. Please select them again.",
+                context, user_menu()
+            )
             return
+
         if len(targets) > MAX_CAMPAIGN_TARGETS:
-            await edit_html(query, f"Your selection exceeds the configured limit of {MAX_CAMPAIGN_TARGETS:,}.", context, user_menu())
+            await edit_html(
+                query,
+                f"Your selection exceeds the configured limit of {MAX_CAMPAIGN_TARGETS:,}.",
+                context, user_menu()
+            )
             return
 
         campaign_id = await create_campaign(
@@ -1141,61 +1249,125 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             datetime.now(timezone.utc),
             None,
         )
+
         count = len(targets)
         context.user_data.pop("confirm_user_campaign", None)
         context.user_data.pop("confirm_user_target_ids", None)
         context.user_data.pop("user_target_selection", None)
         context.user_data.pop("broadcast_draft", None)
+
         await edit_html(
             query,
-            f"<b>Broadcast queued successfully</b>\n\nCampaign: <code>#{campaign_id}</code>\nSelected destinations: <b>{count:,}</b>\nStatus: Queued",
+            f"<b>Broadcast queued successfully</b>\n\n"
+            f"Campaign: <code>#{campaign_id}</code>\n"
+            f"Selected destinations: <b>{count:,}</b>\n"
+            "Status: Queued",
             context,
             InlineKeyboardMarkup([
-                [premium_button("📊 Campaign Reports", callback_data="u:campaigns"), premium_button("🏠 Main Menu", callback_data="u:home")]
+                [
+                    premium_button("📊 Campaign Reports", callback_data="u:campaigns"),
+                    premium_button("🏠 Main Menu", callback_data="u:home"),
+                ]
             ]),
         )
         return
+
     if data == "u:discard":
         context.user_data.pop("broadcast_draft", None)
         context.user_data.pop("confirm_user_campaign", None)
         context.user_data.pop("awaiting_custom_schedule", None)
-        await edit_html(query, "Draft discarded. No campaign was queued.", context, user_menu())
+        await edit_html(
+            query, "Draft discarded. No campaign was queued.",
+            context, user_menu()
+        )
         return
+
     if data.startswith("u:sched:") or data.startswith("u:repeat:"):
         draft = context.user_data.get("broadcast_draft")
         if not draft:
-            await edit_html(query, "No draft found. Send your content to the bot first.", context, user_menu())
+            await edit_html(
+                query, "No draft found. Send your content to the bot first.",
+                context, user_menu()
+            )
             return
+
         repeating = data.startswith("u:repeat:")
         minutes = int(data.rsplit(":", 1)[-1])
         when = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-        campaign_id, count, error = await queue_owned_campaign(user.id, draft, when, minutes if repeating else None, context.bot)
+
+        campaign_id, count, error = await queue_owned_campaign(
+            user.id,
+            draft,
+            when,
+            minutes if repeating else None,
+            context.bot,
+        )
+
         if error:
             await edit_html(query, escape_html(error), context, user_menu())
             return
+
         context.user_data.pop("broadcast_draft", None)
-        label = f"every {minutes:,} minute(s)" if repeating else f"once at {when:%Y-%m-%d %H:%M UTC}"
-        await edit_html(query, f"<b>Schedule created</b>\nCampaign: <code>#{campaign_id}</code>\nDelivery: <b>{label}</b>\nTargets: <b>{count:,}</b>", context,
-                        InlineKeyboardMarkup([[premium_button("📊 Campaign Reports", callback_data="u:campaigns"), premium_button("🏠 Main Menu", callback_data="u:home")]]))
+        label = (
+            f"every {minutes:,} minute(s)"
+            if repeating
+            else f"once at {when:%Y-%m-%d %H:%M UTC}"
+        )
+
+        await edit_html(
+            query,
+            f"<b>Schedule created</b>\n"
+            f"Campaign: <code>#{campaign_id}</code>\n"
+            f"Delivery: <b>{label}</b>\n"
+            f"Targets: <b>{count:,}</b>",
+            context,
+            InlineKeyboardMarkup([
+                [
+                    premium_button("📊 Campaign Reports", callback_data="u:campaigns"),
+                    premium_button("🏠 Main Menu", callback_data="u:home"),
+                ]
+            ]),
+        )
         return
+
     if data == "u:custom":
         if not context.user_data.get("broadcast_draft"):
-            await edit_html(query, "No draft found. Send your content to the bot first.", context, user_menu())
+            await edit_html(
+                query, "No draft found. Send your content to the bot first.",
+                context, user_menu()
+            )
             return
+
         context.user_data["awaiting_custom_schedule"] = True
-        await edit_html(query, "<b>CUSTOM SCHEDULE</b>\n\nSend the UTC date/time in your next message:\n<code>YYYY-MM-DD HH:MM</code>\n\nOptional repeating interval in minutes:\n<code>2026-10-12 15:30 1440</code>\n\nUse 60 for hourly, 1440 for daily, or 10080 for weekly repetition. No message is queued until a valid time is provided.", context,
-                        InlineKeyboardMarkup([[premium_button("✖️ Cancel schedule", callback_data="u:draft")]]))
+        await edit_html(
+            query,
+            "<b>CUSTOM SCHEDULE</b>\n\n"
+            "Send the UTC date/time in your next message:\n"
+            "<code>YYYY-MM-DD HH:MM</code>\n\n"
+            "Optional repeating interval in minutes:\n"
+            "<code>2026-10-12 15:30 1440</code>\n\n"
+            "Use 60 for hourly, 1440 for daily, or 10080 for weekly repetition. "
+            "No message is queued until a valid time is provided.",
+            context,
+            InlineKeyboardMarkup([
+                [premium_button("✖️ Cancel schedule", callback_data="u:draft")]
+            ]),
+        )
         return
+
     if data == "u:destinations":
         try:
             await render_user_destination_picker(query, context, page=0)
         except Exception:
-            logger.exception("Failed to render destination dashboard for user %s", user.id)
+            logger.exception(
+                "Failed to render destination dashboard for user %s", user.id
+            )
             try:
                 if query.message:
                     await query.message.reply_text(
-                        "Destination dashboard could not be loaded. Please try /destinations or /start again. "
-                        "If this repeats, check the Railway logs for the destination callback error."
+                        "Destination dashboard could not be loaded. Please try "
+                        "/destinations or /start again. If this repeats, check "
+                        "the Railway logs for the destination callback error."
                     )
             except TelegramError:
                 pass
@@ -1206,6 +1378,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             page = int(data.rsplit(":", 1)[-1])
         except ValueError:
             page = 0
+
         await render_user_destination_picker(query, context, page)
         return
 
@@ -1214,32 +1387,46 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if len(parts) != 4:
             await query.answer("Invalid destination selection.", show_alert=True)
             return
+
         try:
             chat_id = int(parts[2])
             page = int(parts[3])
         except ValueError:
             await query.answer("Invalid destination ID.", show_alert=True)
             return
+
         allowed = set(await owned_targets(user.id, context.bot))
         if chat_id not in allowed:
-            await query.answer("You no longer have access to that destination.", show_alert=True)
+            await query.answer(
+                "You no longer have access to that destination.",
+                show_alert=True,
+            )
             await render_user_destination_picker(query, context, page)
             return
-        selected = {int(value) for value in context.user_data.get("user_target_selection", [])}
+
+        selected = {
+            int(value)
+            for value in context.user_data.get("user_target_selection", [])
+        }
+
         if chat_id in selected:
             selected.remove(chat_id)
         else:
             selected.add(chat_id)
+
         context.user_data["user_target_selection"] = sorted(selected)
         await render_user_destination_picker(query, context, page)
         return
 
     if data == "u:targetall":
         targets = await owned_targets(user.id, context.bot)
+
         if len(targets) > MAX_CAMPAIGN_TARGETS:
             await edit_html(
                 query,
-                f"You have {len(targets):,} destinations, exceeding the configured campaign limit of {MAX_CAMPAIGN_TARGETS:,}. Select fewer destinations.",
+                f"You have {len(targets):,} destinations, exceeding the "
+                f"configured campaign limit of {MAX_CAMPAIGN_TARGETS:,}. "
+                "Select fewer destinations.",
                 context,
                 InlineKeyboardMarkup([
                     [premium_button("📡 Choose destinations", callback_data="u:sendnow")],
@@ -1247,6 +1434,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 ]),
             )
             return
+
         context.user_data["user_target_selection"] = sorted(set(targets))
         await render_user_destination_picker(query, context, page=0)
         return
@@ -1256,159 +1444,353 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if data == "u:targetcancel":
-        context.user_data.pop("confirm_user_campaign", None)
-        context.user_data.pop("confirm_user_target_ids", None)
+        
         context.user_data.pop("user_target_selection", None)
+
         if context.user_data.get("broadcast_draft"):
-            await edit_html(query, "<b>DRAFT READY</b>\n\nNo campaign was queued. You can send this draft again or schedule it.", context, draft_menu())
+            await edit_html(
+                query,
+                "<b>DRAFT READY</b>\n\n"
+                "No campaign was queued. You can send this draft again or schedule it.",
+                context,
+                draft_menu(),
+            )
         else:
-            await edit_html(query, "<b>Main Dashboard</b>", context, user_menu())
+            await edit_html(
+                query,
+                "<b>Main Dashboard</b>",
+                context,
+                user_menu(),
+            )
         return
 
     if data == "u:campaigns":
         async with get_pool().acquire() as conn:
-            rows = await conn.fetch("SELECT id,status,scheduled_at,total_targets,sent_count,failed_count FROM campaigns WHERE owner_id=$1 ORDER BY id DESC LIMIT 8", user.id)
+            rows = await conn.fetch(
+                """
+                SELECT id, status, scheduled_at, total_targets,
+                       sent_count, failed_count
+                FROM campaigns
+                WHERE owner_id = $1
+                ORDER BY id DESC
+                LIMIT 8
+                """,
+                user.id,
+            )
+
         if not rows:
-            text = "<b>CAMPAIGNS</b>\nNo campaigns yet. Send content to the bot to start."
+            text = (
+                "<b>CAMPAIGNS</b>\n"
+                "No campaigns yet. Send content to the bot to start."
+            )
         else:
             lines = ["<b>RECENT CAMPAIGNS</b>"]
             for row in rows:
-                lines.append(f"\n<b>#{row['id']} · {escape_html(row['status'].title())}</b>\nSent {row['sent_count']}/{row['total_targets']} · Failed {row['failed_count']}\n{row['scheduled_at']:%Y-%m-%d %H:%M UTC}")
+                scheduled_at = row["scheduled_at"]
+                scheduled_text = (
+                    scheduled_at.strftime("%Y-%m-%d %H:%M UTC")
+                    if scheduled_at
+                    else "Not scheduled"
+                )
+                lines.append(
+                    f"\n<b>#{row['id']} · "
+                    f"{escape_html(row['status'].title())}</b>\n"
+                    f"Sent {row['sent_count']}/{row['total_targets']} · "
+                    f"Failed {row['failed_count']}\n"
+                    f"{scheduled_text}"
+                )
             text = "\n".join(lines)
+
         await edit_html(query, text, context, user_menu())
         return
+
     if data == "a:cancelpick":
         context.user_data.pop("pending_admin_selection", None)
         context.user_data.pop("pending_admin_campaign", None)
-        await edit_html(query, "Admin broadcast cancelled. No messages were sent.", context, admin_menu())
+        await edit_html(
+            query,
+            "Admin broadcast cancelled. No messages were sent.",
+            context,
+            admin_menu(),
+        )
         return
+
     if data.startswith("a:pickall:"):
         scope = data.rsplit(":", 1)[-1]
         if scope not in {"users", "groups", "channels", "all"}:
-            await edit_html(query, "Invalid target category.", context, admin_menu())
+            await edit_html(
+                query, "Invalid target category.", context, admin_menu()
+            )
             return
+
         targets = await fetch_admin_target_ids(scope)
-        await prepare_admin_confirmation(query, context, user.id, scope, targets)
+        await prepare_admin_confirmation(
+            query, context, user.id, scope, targets
+        )
         return
+
     if data.startswith("a:pickselect:"):
         parts = data.split(":")
         if len(parts) != 4:
-            await edit_html(query, "Invalid selection page.", context, admin_menu())
+            await edit_html(
+                query, "Invalid selection page.", context, admin_menu()
+            )
             return
+
         scope = parts[2]
         try:
             page = int(parts[3])
         except ValueError:
             page = 0
+
         pending = context.user_data.get("pending_admin_selection")
         if not pending or pending.get("scope") != scope:
-            await edit_html(query, "This target selection expired. Start the broadcast again.", context, admin_menu())
+            await edit_html(
+                query,
+                "This target selection expired. Start the broadcast again.",
+                context,
+                admin_menu(),
+            )
             return
+
         pending.setdefault("selected_ids", [])
         await render_admin_target_picker(query, context, scope, page)
         return
+
     if data.startswith("a:pickpage:"):
         parts = data.split(":")
         if len(parts) != 4:
-            await edit_html(query, "Invalid selection page.", context, admin_menu())
+            await edit_html(
+                query, "Invalid selection page.", context, admin_menu()
+            )
             return
+
         try:
             page = int(parts[3])
         except ValueError:
             page = 0
+
         await render_admin_target_picker(query, context, parts[2], page)
         return
+
     if data.startswith("a:picktoggle:"):
         parts = data.split(":")
         if len(parts) != 5:
-            await edit_html(query, "Invalid recipient selection.", context, admin_menu())
+            await edit_html(
+                query, "Invalid recipient selection.", context, admin_menu()
+            )
             return
+
         scope = parts[2]
         try:
             target_id = int(parts[3])
             page = int(parts[4])
         except ValueError:
-            await edit_html(query, "Invalid recipient ID or page.", context, admin_menu())
+            await edit_html(
+                query, "Invalid recipient ID or page.", context, admin_menu()
+            )
             return
+
         pending = context.user_data.get("pending_admin_selection")
         if not pending or pending.get("scope") != scope:
-            await edit_html(query, "This target selection expired. Start the broadcast again.", context, admin_menu())
+            await edit_html(
+                query,
+                "This target selection expired. Start the broadcast again.",
+                context,
+                admin_menu(),
+            )
             return
-        selected = {int(item) for item in pending.get("selected_ids", [])}
+
+        selected = {
+            int(item) for item in pending.get("selected_ids", [])
+        }
         if target_id in selected:
             selected.remove(target_id)
         else:
             selected.add(target_id)
+
         pending["selected_ids"] = sorted(selected)
         await render_admin_target_picker(query, context, scope, page)
         return
+
     if data.startswith("a:pickdone:"):
         scope = data.rsplit(":", 1)[-1]
         pending = context.user_data.get("pending_admin_selection")
+
         if not pending or pending.get("scope") != scope:
-            await edit_html(query, "This target selection expired. Start the broadcast again.", context, admin_menu())
+            await edit_html(
+                query,
+                "This target selection expired. Start the broadcast again.",
+                context,
+                admin_menu(),
+            )
             return
-        selected = {int(item) for item in pending.get("selected_ids", [])}
+
+        selected = {
+            int(item) for item in pending.get("selected_ids", [])
+        }
         available = set(await fetch_admin_target_ids(scope))
         targets = sorted(selected.intersection(available))
-        await prepare_admin_confirmation(query, context, user.id, scope, targets)
+
+        await prepare_admin_confirmation(
+            query, context, user.id, scope, targets
+        )
         return
+
     if data == "a:cancel":
         context.user_data.pop("pending_admin_campaign", None)
         context.user_data.pop("pending_admin_selection", None)
-        await edit_html(query, "<b>Admin campaign cancelled.</b> No messages were queued.", context, admin_menu())
+        await edit_html(
+            query,
+            "<b>Admin campaign cancelled.</b> No messages were queued.",
+            context,
+            admin_menu(),
+        )
         return
+
     if data == "a:confirm":
         pending = context.user_data.get("pending_admin_campaign")
         if not pending:
-            await edit_html(query, "This confirmation has expired. Start the admin broadcast again.", context, admin_menu())
+            await edit_html(
+                query,
+                "This confirmation has expired. Start the admin broadcast again.",
+                context,
+                admin_menu(),
+            )
             return
+
         if len(pending["targets"]) > MAX_CAMPAIGN_TARGETS:
             context.user_data.pop("pending_admin_campaign", None)
-            await edit_html(query, "Target count exceeds the configured limit. No campaign was queued.", context, admin_menu())
+            await edit_html(
+                query,
+                "Target count exceeds the configured limit. No campaign was queued.",
+                context,
+                admin_menu(),
+            )
             return
-        campaign_id = await create_campaign(user.id, pending["scope"], pending["targets"], pending["source_chat_id"], pending["source_message_id"], datetime.now(timezone.utc), None)
-        scope, count = pending["scope"], len(pending["targets"])
+
+        campaign_id = await create_campaign(
+            user.id,
+            pending["scope"],
+            pending["targets"],
+            pending["source_chat_id"],
+            pending["source_message_id"],
+            datetime.now(timezone.utc),
+            None,
+        )
+
+        scope = pending["scope"]
+        count = len(pending["targets"])
         context.user_data.pop("pending_admin_campaign", None)
-        await edit_html(query, f"<b>Admin campaign queued</b>\nCampaign: <code>#{campaign_id}</code>\nAudience: <b>{escape_html(scope.title())}</b>\nRecipients: <b>{count:,}</b>", context,
-                        InlineKeyboardMarkup([[premium_button("📈 System Stats", callback_data="a:stats:0"), premium_button("🛡 Admin Menu", callback_data="a:home")]]))
+
+        await edit_html(
+            query,
+            f"<b>Admin campaign queued</b>\n"
+            f"Campaign: <code>#{campaign_id}</code>\n"
+            f"Audience: <b>{escape_html(scope.title())}</b>\n"
+            f"Recipients: <b>{count:,}</b>",
+            context,
+            InlineKeyboardMarkup([
+                [
+                    premium_button(
+                        "📈 System Stats", callback_data="a:stats:0"
+                    ),
+                    premium_button(
+                        "🛡 Admin Menu", callback_data="a:home"
+                    ),
+                ]
+            ]),
+        )
         return
+
     if data == "a:stats" or data.startswith("a:stats:"):
         try:
             page = int(data.rsplit(":", 1)[-1]) if ":" in data else 0
         except ValueError:
             page = 0
+
         await render_admin_stats(query, context, page)
         return
+
     if data == "a:exportusers":
         await export_users_csv(query, context)
         return
+
     if data == "a:premium":
-        await edit_html(query, "<b>PREMIUM EMOJI SETUP</b>\n\n1. Send a message containing your custom/premium emojis in the order you want them used.\n2. Reply to that message with <code>/setpremiumemojis</code>.\n3. The bot saves custom emoji IDs in PostgreSQL and applies them to its own message text and inline-button icons where Telegram supports them. The bot owner must have active Telegram Premium for this feature unless the bot has the qualifying Fragment username setup.\n\nOrder: Rocket, Broadcast, Calendar, Destination, Stats, Help, Shield, User, Success, Warning, Failed, Clock, Target, Campaign, Repeat, Sparkle, Settings, Chart.\n\nUse /resetpremiumemojis to remove them.", context,
-                        InlineKeyboardMarkup([[premium_button("🛡 Admin Menu", callback_data="a:home")]]))
+        await edit_html(
+            query,
+            "<b>PREMIUM EMOJI SETUP</b>\n\n"
+            "1. Send a message containing your custom/premium emojis in the order you want them used.\n"
+            "2. Reply to that message with <code>/setpremiumemojis</code>.\n"
+            "3. The bot saves custom emoji IDs in PostgreSQL and applies them to its own message text and inline-button icons where Telegram supports them. The bot owner must have active Telegram Premium for this feature unless the bot has the qualifying Fragment username setup.\n\n"
+            "<b>Order</b>\n"
+            "Rocket, Broadcast, Calendar, Destination, Stats, Help, Shield, User, Success, Warning, Failed, Clock, Target, Campaign, Repeat, Sparkle, Settings, Chart.\n\n"
+            "Use <code>/resetpremiumemojis</code> to remove them.",
+            context,
+            InlineKeyboardMarkup([
+                [premium_button("🛡 Admin Menu", callback_data="a:home")]
+            ]),
+        )
         return
+
     if data.startswith("a:scope:"):
         scope = data.rsplit(":", 1)[-1]
-        await edit_html(query, f"<b>ADMIN BROADCAST · {scope.upper()}</b>\n\nReply to the exact source message with:\n<code>/adminbroadcast {scope}</code>\n\nThe bot will let you choose all recipients or select specific users/groups/channels, then show a confirmation before queueing.", context, admin_menu())
+        await edit_html(
+            query,
+            f"<b>ADMIN BROADCAST · {scope.upper()}</b>\n\n"
+            "Reply to the exact source message with:\n"
+            f"<code>/adminbroadcast {scope}</code>\n\n"
+            "The bot will let you choose all recipients or select specific "
+            "users/groups/channels, then show a confirmation before queueing.",
+            context,
+            admin_menu(),
+        )
         return
-    await edit_html(query, "That menu option is no longer available. Open the dashboard again.", context, user_menu())
+
+    await edit_html(
+        query,
+        "That menu option is no longer available. Open the dashboard again.",
+        context,
+        user_menu(),
+    )
 
 
 def register_handlers(application: Application) -> None:
     commands = [
-        ("start", start), ("help", help_command), ("adminhelp", admin_help),
-        ("register", register_destination), ("destinations", destinations),
-        ("broadcast", broadcast_now), ("schedule", schedule_campaign),
-        ("settime", custom_schedule_command), ("campaigns", list_campaigns),
-        ("cancel", cancel_campaign), ("adminbroadcast", admin_broadcast),
-        ("adminstats", admin_stats), ("setpremiumemojis", set_premium_emojis),
+        ("start", start),
+        ("help", help_command),
+        ("adminhelp", admin_help),
+        ("register", register_destination),
+        ("destinations", destinations),
+        ("broadcast", broadcast_now),
+        ("schedule", schedule_campaign),
+        ("settime", custom_schedule_command),
+        ("campaigns", list_campaigns),
+        ("cancel", cancel_campaign),
+        ("adminbroadcast", admin_broadcast),
+        ("adminstats", admin_stats),
+        ("setpremiumemojis", set_premium_emojis),
         ("resetpremiumemojis", reset_premium_emojis),
     ]
+
     for command, callback in commands:
         application.add_handler(CommandHandler(command, callback))
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^[ua]:"))
-    application.add_handler(ChatMemberHandler(chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
-    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, capture_private_content))
+
+    application.add_handler(
+        CallbackQueryHandler(menu_callback, pattern=r"^[ua]:")
+    )
+    application.add_handler(
+        ChatMemberHandler(
+            chat_member_update,
+            ChatMemberHandler.MY_CHAT_MEMBER,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & ~filters.COMMAND,
+            capture_private_content,
+        )
+    )
 
 
 async def post_handlers_init(application: Application) -> None:
