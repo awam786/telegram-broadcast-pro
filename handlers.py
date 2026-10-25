@@ -1,12 +1,13 @@
-"""All user and admin handlers."""
+"""All user and admin handlers for Telegram Broadcast Pro."""
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from telegram import (
-    Update, Message, Chat, InlineKeyboardButton, InlineKeyboardMarkup,
+    Update, Chat, InlineKeyboardButton, InlineKeyboardMarkup,
+    MessageOriginChannel, MessageOriginChat,
 )
 from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError
@@ -26,22 +27,12 @@ from utils import (
 
 log = logging.getLogger(__name__)
 
-# Callback data contract:
-#   menu:<action>
-#   dst:<action>:<dest_id>          # single destination
-#   dstp:<page>                     # dest pagination
-#   sel:<dest_id>                   # toggle selection
-#   selp:<page>                     # selection pagination
-#   selall / selnone
-#   flow:<action>                   # e.g. confirm_send, schedule, repeat
-#   drf:<action>:<draft_id>
-#   sch:<action>:<job_id>
-#   adm:<action>:<arg>
-#   noop
 
+# ---------------------------------------------------------------------------
+# Guard / auth helpers
+# ---------------------------------------------------------------------------
 
 async def _guard(update: Update, db: Database) -> Optional[Dict[str, Any]]:
-    """Register user, check status. Return user dict or None (blocked)."""
     user = update.effective_user
     if not user:
         return None
@@ -52,7 +43,7 @@ async def _guard(update: Update, db: Database) -> Optional[Dict[str, Any]]:
                 await update.callback_query.answer("Your access is blocked.", show_alert=True)
             except TelegramError:
                 pass
-        else:
+        elif update.effective_message:
             await update.effective_message.reply_text("Your access is blocked by an administrator.")
         return None
     await db.upsert_user(user.id, user.username, user.full_name)
@@ -120,19 +111,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     txt = (
         "<b>User Commands</b>\n"
         "/start — Main menu\n"
-        "/help — This help\n\n"
-        "<b>How to register a group or channel</b>\n"
-        "1. Add this bot to the group/channel as <b>administrator</b> with "
-        "<i>Post Messages</i> (and <i>Edit Messages</i>) permission.\n"
-        "2. Forward any message from that group/channel to this bot.\n"
-        "3. The bot verifies permissions and registers the destination.\n\n"
-        "<b>How to broadcast</b>\n"
-        "1. 📣 New Broadcast → choose destinations → send the message/photo/video you "
-        "want to broadcast to this chat.\n"
-        "2. Confirm / Schedule / Repeat.\n\n"
+        "/help — This help\n"
+        "/register — Run inside a group/channel to register it\n\n"
+        "<b>Registering a group or channel</b>\n"
+        "1. Open the group/channel in Telegram.\n"
+        "2. Administrators → Add Administrator.\n"
+        "3. Search for this bot's username and add it.\n"
+        "4. Grant <b>Post Messages</b> permission (channels: also <b>Edit Messages</b>).\n"
+        "5. Type /register inside the chat — OR — forward a message from it to me.\n\n"
+        "<b>Broadcasting</b>\n"
+        "📣 New Broadcast → pick destinations → send the message you want broadcast → "
+        "confirm / schedule / repeat.\n\n"
         "<b>Premium emoji</b>\n"
-        "When you forward or send content that contains premium (custom) emoji, the bot "
-        "preserves them using Telegram's native copy function."
+        "Custom emoji are preserved via Telegram's native copy when you send or forward "
+        "content that contains them."
     )
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
@@ -197,25 +189,29 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Destination registration
+# Destination registration — FIXED for PTB v21+ (uses forward_origin)
 # ---------------------------------------------------------------------------
 
 async def on_forward_or_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle forwarded message used to register a destination."""
+    """Handle a forwarded message used to register a destination."""
     msg = update.effective_message
+    if not msg:
+        return
+
     db: Database = ctx.application.bot_data["db"]
     user = await _guard(update, db)
     if not user:
         return
+
     origin_chat = None
-    if msg.forward_origin:
-        if hasattr(msg.forward_origin, "chat") and msg.forward_origin.chat:
-            origin_chat = msg.forward_origin.chat
-    if origin_chat is None and msg.forward_from_chat:
-        origin_chat = msg.forward_from_chat
+    fo = msg.forward_origin
+    if isinstance(fo, (MessageOriginChannel, MessageOriginChat)):
+        origin_chat = fo.chat
+
     if origin_chat is None:
-        # Not a forward; ignore (there are other handlers for content)
+        # User forwards or ordinary messages — not a registerable destination.
         return
+
     await _register_destination(update, ctx, origin_chat)
 
 
@@ -225,7 +221,6 @@ async def cmd_register_in_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
         await msg.reply_text("This command only works inside a group or channel.")
         return
-    db: Database = ctx.application.bot_data["db"]
     await _register_destination(update, ctx, chat)
 
 
@@ -235,66 +230,120 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     msg = update.effective_message
     bot = ctx.bot
 
-    # Verify bot is admin with posting rights
-    try:
-        member = await bot.get_chat_member(chat.id, bot.id)
-    except TelegramError as e:
-        await msg.reply_text(f"❌ Could not verify permissions: {esc(e)}", parse_mode=ParseMode.HTML)
-        return
+    chat_label = chat.title or str(chat.id)
+    bot_username = bot.username or "your bot"
 
-    is_admin = getattr(member, "status", "") in ("administrator", "creator")
-    can_post = True
-    if is_admin:
-        can_post = getattr(member, "can_post_messages", True) if chat.type == ChatType.CHANNEL else True
-    if not is_admin:
+    # 1) Can the bot see the chat?
+    try:
+        live_chat = await bot.get_chat(chat.id)
+    except TelegramError as e:
+        s = str(e).lower()
+        if any(k in s for k in ("not found", "invalid", "kicked", "deactivated")):
+            await msg.reply_text(
+                f"❌ I can't access <b>{esc(chat_label)}</b>.\n\n"
+                "Please add me first:\n"
+                "1. Open the group/channel\n"
+                "2. Administrators → Add Administrator\n"
+                f"3. Search <code>@{esc(bot_username)}</code> and add me\n"
+                "4. Grant <b>Post Messages</b> permission\n\n"
+                "Then forward a message again — or run /register inside the chat.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if "forbidden" in s or "admin" in s:
+            await msg.reply_text(
+                f"❌ I don't have permission to inspect <b>{esc(chat_label)}</b>.\n\n"
+                "Please add me as administrator with <b>Post Messages</b> permission.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         await msg.reply_text(
-            f"❌ I'm not an administrator in <b>{esc(chat.title)}</b>.\n\n"
-            "Please promote me to administrator with <b>Post Messages</b> permission, then try again.",
+            f"❌ Could not access chat: <code>{esc(str(e))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
+
+    # 2) Is the bot an admin?
+    try:
+        member = await bot.get_chat_member(live_chat.id, bot.id)
+    except TelegramError as e:
+        s = str(e).lower()
+        if "member list is inaccessible" in s or "forbidden" in s or "admin" in s:
+            await msg.reply_text(
+                f"⚠️ <b>Action required</b> — I'm not an administrator in "
+                f"<b>{esc(live_chat.title or chat.id)}</b>.\n\n"
+                "Please add me as administrator with <b>Post Messages</b> permission:\n"
+                "1. Open the group/channel\n"
+                "2. Administrators → Add Administrator\n"
+                f"3. Search <code>@{esc(bot_username)}</code> and add me\n"
+                "4. Grant <b>Post Messages</b>\n\n"
+                "Then forward a message again — or run /register inside the chat.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await msg.reply_text(
+            f"❌ Could not verify permissions: <code>{esc(str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    is_admin = getattr(member, "status", "") in ("administrator", "creator")
+    if not is_admin:
+        await msg.reply_text(
+            f"⚠️ <b>Action required</b> — I'm a member but not administrator in "
+            f"<b>{esc(live_chat.title or chat.id)}</b>.\n\n"
+            "Please promote me to administrator with <b>Post Messages</b> permission.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    can_post = True
+    if live_chat.type == ChatType.CHANNEL:
+        can_post = bool(getattr(member, "can_post_messages", True))
     if not can_post:
         await msg.reply_text(
-            f"❌ I don't have permission to post in <b>{esc(chat.title)}</b>.\n"
+            f"⚠️ I don't have permission to post messages in "
+            f"<b>{esc(live_chat.title or chat.id)}</b>.\n"
             "Please grant <b>Post Messages</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # Existing?
-    existing = await db.get_destination_by_chat(chat.id)
+    # 3) Already registered?
+    existing = await db.get_destination_by_chat(live_chat.id)
     if existing:
         if await db.is_manager(existing["id"], user.id):
             await msg.reply_text(
                 f"ℹ️ <b>{esc(existing['title'])}</b> is already registered "
                 f"(status: <b>{existing['status']}</b>) and you are an authorized manager.\n"
-                f"Use 📂 My Destinations to manage it.",
+                "Use 📂 My Destinations to manage it.",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            # Ask owner-manager to add them
             await msg.reply_text(
                 f"ℹ️ <b>{esc(existing['title'])}</b> is already registered in the system "
-                f"by another manager. If you administer this destination, ask an existing "
-                f"manager to add you, or contact the bot admin.",
+                "by another manager. If you administer this destination, ask an existing "
+                "manager to add you, or contact the bot admin.",
                 parse_mode=ParseMode.HTML,
             )
         return
 
-    # New
-    dest_type = "channel" if chat.type == ChatType.CHANNEL else (
-        "supergroup" if chat.type == ChatType.SUPERGROUP else "group"
+    # 4) Register
+    dest_type = "channel" if live_chat.type == ChatType.CHANNEL else (
+        "supergroup" if live_chat.type == ChatType.SUPERGROUP else "group"
     )
-    dest_id = await db.add_destination(chat.id, chat.title or str(chat.id), dest_type, user.id)
+    dest_id = await db.add_destination(
+        live_chat.id, live_chat.title or str(live_chat.id), dest_type, user.id,
+    )
     await msg.reply_text(
-        f"✅ Registered <b>{esc(chat.title)}</b> as a {dest_type}.\n"
+        f"✅ Registered <b>{esc(live_chat.title or live_chat.id)}</b> as a {dest_type}.\n"
         f"Destination ID: <code>{dest_id}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
 # ---------------------------------------------------------------------------
-# Destinations list / detail / actions
+# Destinations
 # ---------------------------------------------------------------------------
 
 async def _show_destinations(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int) -> None:
@@ -307,7 +356,8 @@ async def _show_destinations(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pag
             "<b>No destinations yet.</b>\n\n"
             "To register a group/channel:\n"
             "1. Add me as administrator with <b>Post Messages</b> permission.\n"
-            "2. Forward any message from that group/channel here."
+            "2. Forward any message from that group/channel here — OR — type "
+            "<code>/register</code> inside the chat."
         )
         markup = kb([[btn("⬅️ Back", "menu:home")]])
     else:
@@ -361,7 +411,8 @@ async def on_dst_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Status: <b>{d['status']}</b>\n"
         f"Last verified: {fmt_dt(d['last_verified'])}\n"
         f"Managers: {mgr_str}\n"
-        + (f"\nLast error: <code>{esc(truncate(d.get('last_error'), 200))}</code>" if d.get("last_error") else "")
+        + (f"\nLast error: <code>{esc(truncate(d.get('last_error'), 200))}</code>"
+           if d.get("last_error") else "")
     )
     rows = [
         [btn("🔄 Recheck", f"dst:recheck:{dest_id}")],
@@ -427,7 +478,8 @@ async def on_dst_do_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     dest_id = parse_int(q.data.split(":")[2])
     d = await db.get_destination(dest_id) if dest_id else None
     if not d or not await db.is_manager(dest_id, update.effective_user.id):
-        await q.edit_message_text("Not authorized.", reply_markup=kb([[btn("⬅️ Back", "menu:dest")]]))
+        await q.edit_message_text("Not authorized.",
+                                  reply_markup=kb([[btn("⬅️ Back", "menu:dest")]]))
         return
     await db.remove_destination(dest_id)
     await q.edit_message_text("✅ Removed.", reply_markup=kb([[btn("⬅️ Back", "menu:dest")]]))
@@ -470,10 +522,7 @@ async def _render_dest_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         icon = "📢" if d["dest_type"] == "channel" else "👥"
         rows.append([btn(f"{mark} {icon} {d['title'][:38]}", f"sel:{d['id']}")])
 
-    ctrl = [
-        btn("✅ Select all", "selall"),
-        btn("⬜ None", "selnone"),
-    ]
+    ctrl = [btn("✅ Select all", "selall"), btn("⬜ None", "selnone")]
     nav = [btn("⬅️", f"selp:{page-1}")] if page > 1 else []
     nav.append(btn(f"{page}/{pages}", "noop"))
     if page < pages:
@@ -576,7 +625,6 @@ async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text("No destinations selected.")
         return
 
-    # Learn emoji if present (best-effort)
     try:
         ents = msg.entities or msg.caption_entities or []
         await emoji.learn_from_message(msg.text or msg.caption or "", ents, user.id)
@@ -786,7 +834,7 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ---------------------------------------------------------------------------
-# Schedule input handling (text)
+# Schedule / repeat text input
 # ---------------------------------------------------------------------------
 
 async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -795,7 +843,6 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg = update.effective_message
     db: Database = ctx.application.bot_data["db"]
-    cfg: Config = ctx.application.bot_data["cfg"]
     user = update.effective_user
     tz = await db.get_user_tz(user.id)
 
@@ -830,9 +877,7 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         ctx.user_data["repeat_seconds"] = secs
         ctx.user_data["flow"] = "repeat_max"
-        await msg.reply_text(
-            "Max number of repetitions (send a number, or 0 for unlimited):"
-        )
+        await msg.reply_text("Max number of repetitions (send a number, or 0 for unlimited):")
     elif flow == "repeat_max":
         try:
             mx = int(msg.text or "0")
@@ -1017,9 +1062,11 @@ async def on_sch_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     rows = []
     if job["status"] == "active":
-        rows.append([btn("⏸ Pause", f"sch:pause:{job_id}"), btn("🚫 Cancel", f"sch:confirm_cancel:{job_id}")])
+        rows.append([btn("⏸ Pause", f"sch:pause:{job_id}"),
+                     btn("🚫 Cancel", f"sch:confirm_cancel:{job_id}")])
     elif job["status"] == "paused":
-        rows.append([btn("▶️ Resume", f"sch:resume:{job_id}"), btn("🚫 Cancel", f"sch:confirm_cancel:{job_id}")])
+        rows.append([btn("▶️ Resume", f"sch:resume:{job_id}"),
+                     btn("🚫 Cancel", f"sch:confirm_cancel:{job_id}")])
     rows.append([btn("⬅️ Back", "menu:home")])
     await q.edit_message_text(txt, reply_markup=kb(rows), parse_mode=ParseMode.HTML)
 
@@ -1169,7 +1216,8 @@ async def on_camp_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         lines = []
         for t in targets[:20]:
             lines.append(f"• <code>{t['target_chat_id']}</code> — {t['status']}"
-                         + (f" — {esc(truncate(t['last_error'], 40))}" if t.get("last_error") else ""))
+                         + (f" — {esc(truncate(t['last_error'], 40))}"
+                            if t.get("last_error") else ""))
         more = "" if len(targets) <= 20 else f"\n…and {len(targets)-20} more"
         await q.edit_message_text(
             "<b>Destination results</b>\n" + "\n".join(lines) + more,
@@ -1280,7 +1328,8 @@ async def on_adm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uid = parse_int(arg)
         u = await db.get_user(uid) if uid else None
         if not u:
-            await q.edit_message_text("Not found.", reply_markup=kb([[btn("⬅️ Back", "adm:users:0")]]))
+            await q.edit_message_text("Not found.",
+                                      reply_markup=kb([[btn("⬅️ Back", "adm:users:0")]]))
             return
         txt = (
             f"<b>User {u['telegram_id']}</b>\n"
@@ -1349,8 +1398,8 @@ async def on_adm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=update.effective_user.id, document=open(path, "rb"),
                 filename="users.xlsx",
             )
-            import os; os.unlink(path)
-            await q.answer("Sent.", show_alert=False)
+            import os
+            os.unlink(path)
         except Exception as e:
             log.exception("Export failed")
             await q.answer(f"Export failed: {e}", show_alert=True)
@@ -1365,12 +1414,26 @@ async def on_adm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
     elif action == "bcall":
-        # Simple: prompt for text, then broadcast to all
         ctx.user_data["admin_flow"] = "broadcast_all"
         await q.edit_message_text(
             "Send the text you want broadcast to all users.",
             reply_markup=kb([[btn("✖️ Cancel", "adm:home")]]),
         )
+
+
+# ---------------------------------------------------------------------------
+# Global error handler
+# ---------------------------------------------------------------------------
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled exception: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong. The error was logged."
+            )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1420,12 +1483,14 @@ def register(app, cfg: Config) -> None:
     # Admin
     app.add_handler(CallbackQueryHandler(on_adm, pattern=r"^adm:"))
 
-    # Text inputs (must be last)
+    # Text inputs (must come after callback handlers)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input))
 
-    # Content (image/video/document/etc) — capture in await_content flow
-    app.add_handler(MessageHandler(
-        ~filters.COMMAND & ~filters.FORWARDED,
-        on_content_message,
-    ))
+    # Forwarded messages → destination registration
     app.add_handler(MessageHandler(filters.FORWARDED, on_forward_or_group_message))
+
+    # Ordinary content (images, videos, etc.) in broadcast flows
+    app.add_handler(MessageHandler(~filters.COMMAND, on_content_message))
+
+    # Global error handler (must be last)
+    app.add_error_handler(_on_error)
