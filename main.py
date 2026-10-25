@@ -6,6 +6,7 @@ import signal
 import asyncio
 from datetime import datetime, timezone
 
+from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
 import handlers as h
@@ -55,7 +56,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    app = ApplicationBuilder().token(cfg.bot_token).post_init(_post_init).post_shutdown(_post_shutdown).build()
+    app = (
+        ApplicationBuilder()
+        .token(cfg.bot_token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     app.bot_data["cfg"] = cfg
     app.bot_data["db"] = Database(cfg.database_url)
     app.bot_data["emoji"] = EmojiManager(app.bot_data["db"])
@@ -63,7 +70,14 @@ def main() -> None:
     h.register(app, cfg)
 
     log.info("Starting polling...")
-    app.run_polling(drop_pending_updates=False, allowed_updates=None)
+    app.run_polling(
+        drop_pending_updates=False,
+        allowed_updates=[
+            Update.MESSAGE,
+            Update.CALLBACK_QUERY,
+            Update.MY_CHAT_MEMBER,
+        ],
+    )
 
 
 if __name__ == "__main__":
