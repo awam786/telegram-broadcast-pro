@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import asyncpg
 
@@ -127,6 +127,13 @@ CREATE TABLE IF NOT EXISTS user_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS user_flows (
+    user_telegram_id BIGINT PRIMARY KEY,
+    flow TEXT,
+    data JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS bot_settings (
     key TEXT PRIMARY KEY,
     value TEXT,
@@ -169,6 +176,17 @@ class Database:
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
         async with self.pool.acquire() as con:
             await con.execute(SCHEMA)
+            # Defensive: guarantee user_flows exists
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_flows (
+                    user_telegram_id BIGINT PRIMARY KEY,
+                    flow TEXT,
+                    data JSONB,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
         log.info("Database connected and schema ensured")
 
     async def close(self) -> None:
@@ -347,7 +365,7 @@ class Database:
             return await con.fetchval(
                 """INSERT INTO drafts(user_telegram_id, source_chat_id, source_message_id,
                                       source_message_json, emoji_mode)
-                   VALUES($1,$2,$3,$4,$5) RETURNING id""",
+                   VALUES($1,$2,$3,$4::jsonb,$5) RETURNING id""",
                 user_tg, source_chat_id, source_message_id,
                 json.dumps(message_json), emoji_mode,
             )
@@ -406,7 +424,7 @@ class Database:
                 """INSERT INTO campaigns(user_telegram_id, source_chat_id, source_message_id,
                                          source_message_json, content_summary, emoji_mode,
                                          status, scheduled_at, is_admin_campaign)
-                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id""",
+                   VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9) RETURNING id""",
                 user_tg, source_chat_id, source_message_id,
                 json.dumps(message_json), summary, emoji_mode,
                 status, scheduled_at, is_admin,
@@ -644,7 +662,7 @@ class Database:
         async with self.pool.acquire() as con:
             await con.execute(
                 """INSERT INTO admin_actions(admin_telegram_id, action, target_type, target_id, details)
-                   VALUES($1,$2,$3,$4,$5)""",
+                   VALUES($1,$2,$3,$4,$5::jsonb)""",
                 admin_tg, action, target_type, target_id,
                 json.dumps(details) if details else None,
             )
@@ -660,6 +678,7 @@ class Database:
                 "failed_targets": await con.fetchval(
                     "SELECT COUNT(*) FROM campaign_targets WHERE status IN ('failed','uncertain')") or 0,
             }
+
     # ---------------- User flow state ----------------
     async def get_flow(self, user_tg: int) -> tuple[Optional[str], dict]:
         async with self.pool.acquire() as con:
@@ -696,7 +715,7 @@ class Database:
             row = await con.fetchrow(
                 "SELECT data FROM user_flows WHERE user_telegram_id=$1", user_tg
             )
-            current = {}
+            current: dict = {}
             if row and row["data"]:
                 d = row["data"]
                 if isinstance(d, str):
