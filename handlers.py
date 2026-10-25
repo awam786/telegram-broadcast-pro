@@ -31,8 +31,27 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Guard / auth helpers
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _dest_ids_from_draft(draft: dict) -> list[int]:
+    """Decode a draft's selected_destinations JSONB into a list of ints."""
+    raw = draft.get("selected_destinations")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[int] = []
+    for x in raw:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
 
 async def _guard(update: Update, db: Database) -> Optional[Dict[str, Any]]:
     user = update.effective_user
@@ -201,7 +220,7 @@ async def on_forward_or_group_message(update: Update, ctx: ContextTypes.DEFAULT_
     if not msg:
         return
 
-    # IMPORTANT: if the user is mid-broadcast, this is content, not registration.
+    # If user is mid-broadcast, this is content, not a registration forward.
     if ctx.user_data.get("flow") == "await_content":
         return
 
@@ -686,7 +705,7 @@ async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             ctx.user_data.pop("flow", None)
             ctx.user_data.pop("replace_draft_id", None)
             return
-        sel = old.get("selected_destinations") or []
+        sel = _dest_ids_from_draft(old)
         await db.delete_draft(replace_draft_id, user.id)
         ctx.user_data.pop("replace_draft_id", None)
     else:
@@ -710,7 +729,7 @@ async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             message_json=message_to_json(msg),
             emoji_mode="auto",
         )
-        await db.update_draft_selection(draft_id, user.id, list(sel))
+        await db.update_draft_selection(draft_id, user.id, [int(x) for x in sel])
     except Exception:
         log.exception("Failed to create draft")
         await msg.reply_text("⚠️ Failed to save draft. Please try again.")
@@ -815,7 +834,7 @@ async def on_drf_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _render_draft_options(update: Update, ctx: ContextTypes.DEFAULT_TYPE, draft: dict) -> None:
     q = update.callback_query
-    sel = draft.get("selected_destinations") or []
+    sel = _dest_ids_from_draft(draft)
     rows = [
         [btn("📤 Send Now", f"drf:sendnow:{draft['id']}")],
         [btn("🗓 Schedule", f"drf:schedule:{draft['id']}")],
@@ -833,7 +852,7 @@ async def _render_draft_options(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
 async def _send_now_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, draft: dict) -> None:
     q = update.callback_query
-    sel = draft.get("selected_destinations") or []
+    sel = _dest_ids_from_draft(draft)
     if not sel:
         await q.edit_message_text("No destinations selected.")
         return
@@ -870,7 +889,14 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    dest_ids = draft.get("selected_destinations") or []
+    dest_ids = _dest_ids_from_draft(draft)
+    if not dest_ids:
+        await q.edit_message_text(
+            "⚠️ This draft has no destinations. Please start a new broadcast.",
+            reply_markup=kb([[btn("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
     targets = []
     for did in dest_ids:
         d = await db.get_destination(did)
@@ -878,12 +904,18 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             targets.append({"destination_id": did, "target_chat_id": d["chat_id"]})
 
     if not targets:
-        await q.edit_message_text("No valid destinations.")
+        await q.edit_message_text(
+            "⚠️ None of the selected destinations are still valid for you.",
+            reply_markup=kb([[btn("🏠 Main menu", "menu:home")]]),
+        )
         return
 
     msg_json = draft["source_message_json"]
     if isinstance(msg_json, str):
-        msg_json = json.loads(msg_json)
+        try:
+            msg_json = json.loads(msg_json)
+        except (ValueError, TypeError):
+            msg_json = {}
 
     campaign_id = await db.create_campaign(
         user_tg=update.effective_user.id,
@@ -998,7 +1030,7 @@ async def _create_scheduled_campaign(
     if not draft:
         await msg.reply_text("Draft not found.")
         return
-    dest_ids = draft.get("selected_destinations") or []
+    dest_ids = _dest_ids_from_draft(draft)
     targets = []
     for did in dest_ids:
         d = await db.get_destination(did)
@@ -1010,7 +1042,10 @@ async def _create_scheduled_campaign(
 
     msg_json = draft["source_message_json"]
     if isinstance(msg_json, str):
-        msg_json = json.loads(msg_json)
+        try:
+            msg_json = json.loads(msg_json)
+        except (ValueError, TypeError):
+            msg_json = {}
 
     campaign_id = await db.create_campaign(
         user_tg=user.id,
