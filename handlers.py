@@ -35,7 +35,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _dest_ids_from_draft(draft: dict) -> list[int]:
-    """Decode a draft's selected_destinations JSONB into a list of ints."""
     raw = draft.get("selected_destinations")
     if isinstance(raw, str):
         try:
@@ -112,6 +111,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = await _guard(update, db)
     if not user:
         return
+    # Clear any stale flow
+    await db.set_flow(user["telegram_id"], None)
     name = esc(user["display_name"])
     txt = (
         f"👋 Welcome, <b>{name}</b>!\n\n"
@@ -133,22 +134,31 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>User Commands</b>\n"
         "/start — Main menu\n"
         "/help — This help\n"
+        "/cancel — Cancel current flow\n"
         "/register — Run inside a group/channel to register it\n"
         "/sync — Recheck all your registered destinations\n\n"
         "<b>Registering a group or channel</b>\n"
         "1. Open the group/channel in Telegram.\n"
         "2. Administrators → Add Administrator.\n"
         "3. Search for this bot's username and add it.\n"
-        "4. Grant <b>Post Messages</b> permission (channels: also <b>Edit Messages</b>).\n"
+        "4. Grant <b>Post Messages</b> permission.\n"
         "5. Type /register inside the chat — OR — forward a message from it to me.\n\n"
         "<b>Broadcasting</b>\n"
-        "📣 New Broadcast → pick destinations → send the message you want broadcast → "
-        "confirm / schedule / repeat.\n\n"
-        "<b>Premium emoji</b>\n"
-        "Custom emoji are preserved via Telegram's native copy when you send or forward "
-        "content that contains them."
+        "📣 New Broadcast → pick destinations → send the message → confirm/schedule/repeat."
     )
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = ctx.application.bot_data["db"]
+    user = await _guard(update, db)
+    if not user:
+        return
+    await db.set_flow(user["telegram_id"], None)
+    await update.effective_message.reply_text(
+        "Cancelled. Use /start to begin again.",
+        reply_markup=kb([[btn("🏠 Main menu", "menu:home")]]),
+    )
 
 
 async def cmd_adminhelp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -159,8 +169,7 @@ async def cmd_adminhelp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Admin Commands</b>\n"
         "/adminhelp — This help\n"
         "/admin — Admin panel\n\n"
-        "Only IDs listed in ADMIN_IDS can use the admin panel. "
-        "All privileged actions are logged."
+        "Only IDs listed in ADMIN_IDS can use the admin panel."
     )
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
@@ -181,6 +190,10 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
     action = q.data.split(":", 1)[1]
+
+    # Clear flow when navigating to a menu (unless it's a mid-flow action)
+    if action in ("home", "dest", "drafts", "sched", "rep", "stats", "history", "settings", "help"):
+        await db.set_flow(user["telegram_id"], None)
 
     if action == "new":
         await _start_new_broadcast(update, ctx)
@@ -215,19 +228,21 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 async def on_forward_or_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle a forwarded message used to register a destination."""
     msg = update.effective_message
     if not msg:
         return
 
-    # If user is mid-broadcast, this is content, not a registration forward.
-    if ctx.user_data.get("flow") == "await_content":
-        return
-
     db: Database = ctx.application.bot_data["db"]
-    user = await _guard(update, db)
+    user = update.effective_user
     if not user:
         return
+
+    # Check flow state — if mid-broadcast, this is content
+    flow, _ = await db.get_flow(user.id)
+    if flow == "await_content":
+        return
+
+    await _guard(update, db)
 
     origin_chat = None
     fo = msg.forward_origin
@@ -364,19 +379,14 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
 
 
 async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Recheck all destinations where the bot is a member."""
     db: Database = ctx.application.bot_data["db"]
     user = update.effective_user
     msg = update.effective_message
-
     dests = await db.user_destinations(user.id)
     if not dests:
         await msg.reply_text("You have no registered destinations.")
         return
-
-    ok = 0
-    lost = 0
-    no_admin = 0
+    ok = lost = no_admin = 0
     for d in dests:
         try:
             member = await ctx.bot.get_chat_member(d["chat_id"], ctx.bot.id)
@@ -389,22 +399,16 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await db.update_destination_status(d["id"], "active", None)
                     ok += 1
                 else:
-                    await db.update_destination_status(
-                        d["id"], "missing_permissions", "No Post Messages")
+                    await db.update_destination_status(d["id"], "missing_permissions", "No Post Messages")
                     no_admin += 1
             else:
-                await db.update_destination_status(
-                    d["id"], "missing_permissions", f"Bot is {status}")
+                await db.update_destination_status(d["id"], "missing_permissions", f"Bot is {status}")
                 no_admin += 1
         except TelegramError as e:
             await db.update_destination_status(d["id"], "inaccessible", str(e))
             lost += 1
-
     await msg.reply_text(
-        f"<b>Sync complete</b>\n"
-        f"✅ OK: {ok}\n"
-        f"⚠️ Missing admin rights: {no_admin}\n"
-        f"❌ Inaccessible: {lost}",
+        f"<b>Sync complete</b>\n✅ OK: {ok}\n⚠️ Missing admin: {no_admin}\n❌ Inaccessible: {lost}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -553,7 +557,7 @@ async def on_dst_do_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# New broadcast flow
+# New broadcast flow (DB-backed state)
 # ---------------------------------------------------------------------------
 
 async def _start_new_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -570,9 +574,10 @@ async def _start_new_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             await update.effective_message.reply_text(txt, reply_markup=markup)
         return
 
-    ctx.user_data["flow"] = "select_dests"
-    ctx.user_data["selected_destinations"] = set()
-    ctx.user_data["all_destinations"] = [d["id"] for d in dests]
+    await db.set_flow(user.id, "select_dests", {
+        "selected": [],
+        "all_destinations": [d["id"] for d in dests],
+    })
     await _render_dest_selection(update, ctx, page=1)
 
 
@@ -580,7 +585,8 @@ async def _render_dest_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     db: Database = ctx.application.bot_data["db"]
     user = update.effective_user
     dests = await db.user_destinations(user.id)
-    selected = ctx.user_data.get("selected_destinations", set())
+    flow, data = await db.get_flow(user.id)
+    selected = set(data.get("selected") or [])
 
     items, page, pages = paginate(dests, page)
     rows = []
@@ -618,28 +624,38 @@ async def _render_dest_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 async def on_sel_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
+    db: Database = ctx.application.bot_data["db"]
+    user = update.effective_user
     dest_id = parse_int(q.data.split(":")[1])
     if not dest_id:
         return
-    sel = ctx.user_data.setdefault("selected_destinations", set())
-    if dest_id in sel:
-        sel.remove(dest_id)
+    flow, data = await db.get_flow(user.id)
+    selected = set(data.get("selected") or [])
+    if dest_id in selected:
+        selected.discard(dest_id)
     else:
-        sel.add(dest_id)
+        selected.add(dest_id)
+    await db.update_flow_data(user.id, selected=list(selected))
     await _render_dest_selection(update, ctx, page=1)
 
 
 async def on_sel_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    ctx.user_data["selected_destinations"] = set(ctx.user_data.get("all_destinations", []))
+    db: Database = ctx.application.bot_data["db"]
+    user = update.effective_user
+    flow, data = await db.get_flow(user.id)
+    all_ids = data.get("all_destinations") or []
+    await db.update_flow_data(user.id, selected=list(all_ids))
     await _render_dest_selection(update, ctx, page=1)
 
 
 async def on_sel_none(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    ctx.user_data["selected_destinations"] = set()
+    db: Database = ctx.application.bot_data["db"]
+    user = update.effective_user
+    await db.update_flow_data(user.id, selected=[])
     await _render_dest_selection(update, ctx, page=1)
 
 
@@ -653,19 +669,21 @@ async def on_selp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_flow_confirm_dests(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    sel = ctx.user_data.get("selected_destinations", set())
+    db: Database = ctx.application.bot_data["db"]
+    user = update.effective_user
+    flow, data = await db.get_flow(user.id)
+    sel = data.get("selected") or []
     if not sel:
         await q.answer("Select at least one destination.", show_alert=True)
         return
-    ctx.user_data["flow"] = "await_content"
-    log.info("Awaiting content from user %s, selected=%d destinations",
-             update.effective_user.id, len(sel))
+    await db.set_flow(user.id, "await_content", {"selected": sel})
+    log.info("User %s awaiting content, selected=%d", user.id, len(sel))
     await q.edit_message_text(
         "<b>Step 2/4 — Send your content</b>\n\n"
         "Now <b>send or forward the message</b> you want to broadcast. It can be text, "
         "photo, video, document, audio, sticker, etc. Custom/premium emoji will be "
         "preserved by Telegram's native copy.\n\n"
-        "You can send it as a reply or a new message in this chat.",
+        "Use /cancel to abort at any time.",
         reply_markup=kb([[btn("✖️ Cancel", "flow:cancel")]]),
         parse_mode=ParseMode.HTML,
     )
@@ -674,46 +692,42 @@ async def on_flow_confirm_dests(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 async def on_flow_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    ctx.user_data.pop("flow", None)
-    ctx.user_data.pop("selected_destinations", None)
-    ctx.user_data.pop("draft_id", None)
+    db: Database = ctx.application.bot_data["db"]
+    await db.set_flow(update.effective_user.id, None)
     await q.edit_message_text("Cancelled.", reply_markup=kb([[btn("🏠 Main menu", "menu:home")]]))
 
 
 async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """User sent the message we should broadcast (only when awaiting)."""
-    flow = ctx.user_data.get("flow")
-    log.info("on_content_message: user=%s flow=%s",
-             update.effective_user.id if update.effective_user else None, flow)
-    if flow != "await_content":
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
         return
 
     db: Database = ctx.application.bot_data["db"]
     emoji: EmojiManager = ctx.application.bot_data["emoji"]
-    msg = update.effective_message
-    user = update.effective_user
 
-    if not msg or not user:
+    flow, data = await db.get_flow(user.id)
+    log.info("on_content_message: user=%s flow=%s", user.id, flow)
+    if flow != "await_content":
         return
 
-    replace_draft_id = ctx.user_data.get("replace_draft_id")
+    replace_draft_id = data.get("replace_draft_id")
 
     if replace_draft_id:
         old = await db.get_draft(replace_draft_id, user.id)
         if not old:
             await msg.reply_text("Original draft not found. Please start a new broadcast.")
-            ctx.user_data.pop("flow", None)
-            ctx.user_data.pop("replace_draft_id", None)
+            await db.set_flow(user.id, None)
             return
         sel = _dest_ids_from_draft(old)
         await db.delete_draft(replace_draft_id, user.id)
-        ctx.user_data.pop("replace_draft_id", None)
     else:
-        sel = ctx.user_data.get("selected_destinations", set())
+        sel = data.get("selected") or []
         if not sel:
             await msg.reply_text("No destinations selected. Please start again.")
+            await db.set_flow(user.id, None)
             return
-        sel = list(sel)
 
     try:
         ents = msg.entities or msg.caption_entities or []
@@ -735,8 +749,7 @@ async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text("⚠️ Failed to save draft. Please try again.")
         return
 
-    ctx.user_data["draft_id"] = draft_id
-    ctx.user_data["flow"] = "draft_options"
+    await db.set_flow(user.id, "draft_options", {"draft_id": draft_id})
 
     summary = summary_from_message(msg)
     txt = (
@@ -744,7 +757,7 @@ async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         f"Draft ID: <code>{draft_id}</code>\n"
         f"Summary: {esc(summary)}\n"
         f"Destinations: <b>{len(sel)}</b>\n"
-        f"Emoji mode: <b>auto</b> (native copy preserves premium emoji)\n\n"
+        f"Emoji mode: <b>auto</b>\n\n"
         "Choose what to do:"
     )
     rows = [
@@ -772,11 +785,12 @@ async def on_drf_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text("Draft not found.")
         return
 
+    user_id = update.effective_user.id
+
     if action == "sendnow":
         await _send_now_confirm(update, ctx, draft)
     elif action == "schedule":
-        ctx.user_data["flow"] = "schedule_input"
-        ctx.user_data["schedule_draft_id"] = draft_id
+        await db.set_flow(user_id, "schedule_input", {"schedule_draft_id": draft_id})
         await q.edit_message_text(
             "Send the schedule time as <code>YYYY-MM-DD HH:MM</code> "
             "(in your timezone, default UTC).\n"
@@ -785,8 +799,7 @@ async def on_drf_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=kb([[btn("✖️ Cancel", "flow:cancel")]]),
         )
     elif action == "repeat":
-        ctx.user_data["flow"] = "repeat_interval"
-        ctx.user_data["repeat_draft_id"] = draft_id
+        await db.set_flow(user_id, "repeat_interval", {"repeat_draft_id": draft_id})
         await q.edit_message_text(
             "Send the <b>first run time</b> as <code>YYYY-MM-DD HH:MM</code>.",
             parse_mode=ParseMode.HTML,
@@ -808,7 +821,7 @@ async def on_drf_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     elif action == "setemoji":
         mode = parts[3]
-        await db.update_draft_emoji_mode(draft_id, update.effective_user.id, mode)
+        await db.update_draft_emoji_mode(draft_id, user_id, mode)
         await q.edit_message_text(
             f"Emoji mode set to <b>{mode}</b>.",
             reply_markup=kb([[btn("⬅️ Back", f"drf:back:{draft_id}")]]),
@@ -817,15 +830,14 @@ async def on_drf_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif action == "back":
         await _render_draft_options(update, ctx, draft)
     elif action == "replace":
-        ctx.user_data["flow"] = "await_content"
-        ctx.user_data["replace_draft_id"] = draft_id
+        await db.set_flow(user_id, "await_content", {"replace_draft_id": draft_id})
         await q.edit_message_text(
             "Send the new content now.",
             reply_markup=kb([[btn("✖️ Cancel", "flow:cancel")]]),
         )
     elif action == "discard":
-        await db.delete_draft(draft_id, update.effective_user.id)
-        ctx.user_data.pop("flow", None)
+        await db.delete_draft(draft_id, user_id)
+        await db.set_flow(user_id, None)
         await q.edit_message_text(
             "🗑 Draft discarded.",
             reply_markup=kb([[btn("🏠 Main menu", "menu:home")]]),
@@ -929,8 +941,7 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     )
     await db.add_campaign_targets(campaign_id, targets)
     await db.delete_draft(draft_id, update.effective_user.id)
-    ctx.user_data.pop("flow", None)
-    ctx.user_data.pop("draft_id", None)
+    await db.set_flow(update.effective_user.id, None)
 
     await q.edit_message_text(
         f"🚀 Campaign <b>#{campaign_id}</b> queued for <b>{len(targets)}</b> destination(s).\n"
@@ -942,18 +953,20 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ---------------------------------------------------------------------------
-# Schedule / repeat text input
+# Schedule / repeat text input (DB-backed)
 # ---------------------------------------------------------------------------
 
 async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    flow = ctx.user_data.get("flow")
-    if not flow:
-        return
-    if flow == "await_content":
-        return
     msg = update.effective_message
-    db: Database = ctx.application.bot_data["db"]
     user = update.effective_user
+    if not msg or not user:
+        return
+
+    db: Database = ctx.application.bot_data["db"]
+    flow, data = await db.get_flow(user.id)
+    if not flow or flow == "await_content":
+        return
+
     tz = await db.get_user_tz(user.id)
 
     if flow == "schedule_input":
@@ -964,7 +977,8 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if dt <= datetime.now(timezone.utc):
             await msg.reply_text("Time must be in the future.")
             return
-        await _create_scheduled_campaign(update, ctx, dt, repeat_seconds=None, max_reps=None, end_at=None)
+        draft_id = data.get("schedule_draft_id")
+        await _create_scheduled_campaign(update, ctx, draft_id, dt, None, None, None)
     elif flow == "repeat_interval":
         dt = parse_datetime_local(msg.text or "", tz)
         if not dt:
@@ -973,11 +987,11 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if dt <= datetime.now(timezone.utc):
             await msg.reply_text("Start time must be in the future.")
             return
-        ctx.user_data["repeat_start_dt"] = dt.isoformat()
-        ctx.user_data["flow"] = "repeat_interval_value"
+        await db.set_flow(user.id, "repeat_interval_value", {
+            **data, "repeat_start_dt": dt.isoformat()
+        })
         await msg.reply_text(
-            "Send the repeat interval, e.g. <code>1h</code>, <code>30m</code>, "
-            "<code>2d</code>, or a number of minutes.",
+            "Send the repeat interval, e.g. <code>1h</code>, <code>30m</code>, <code>2d</code>.",
             parse_mode=ParseMode.HTML,
         )
     elif flow == "repeat_interval_value":
@@ -985,8 +999,7 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not secs or secs < 60:
             await msg.reply_text("Interval too small or invalid (min 60 seconds).")
             return
-        ctx.user_data["repeat_seconds"] = secs
-        ctx.user_data["flow"] = "repeat_max"
+        await db.set_flow(user.id, "repeat_max", {**data, "repeat_seconds": secs})
         await msg.reply_text("Max number of repetitions (send a number, or 0 for unlimited):")
     elif flow == "repeat_max":
         try:
@@ -998,11 +1011,10 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("Must be >= 0.")
             return
         mx_opt = mx if mx > 0 else None
-        start_dt = datetime.fromisoformat(ctx.user_data["repeat_start_dt"])
-        secs = ctx.user_data["repeat_seconds"]
-        await _create_scheduled_campaign(
-            update, ctx, start_dt, repeat_seconds=secs, max_reps=mx_opt, end_at=None,
-        )
+        start_dt = datetime.fromisoformat(data["repeat_start_dt"])
+        secs = data["repeat_seconds"]
+        draft_id = data.get("repeat_draft_id")
+        await _create_scheduled_campaign(update, ctx, draft_id, start_dt, secs, mx_opt, None)
     elif flow == "settings_tz":
         from zoneinfo import ZoneInfo
         try:
@@ -1011,24 +1023,26 @@ async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("Invalid timezone. Example: Europe/London")
             return
         await db.set_user_tz(user.id, (msg.text or "").strip())
-        ctx.user_data.pop("flow", None)
+        await db.set_flow(user.id, None)
         await msg.reply_text("✅ Timezone updated.")
 
 
 async def _create_scheduled_campaign(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, start_dt: datetime,
-    repeat_seconds: Optional[int], max_reps: Optional[int], end_at: Optional[datetime],
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, draft_id: Optional[int],
+    start_dt: datetime, repeat_seconds: Optional[int], max_reps: Optional[int],
+    end_at: Optional[datetime],
 ) -> None:
     db: Database = ctx.application.bot_data["db"]
     msg = update.effective_message
     user = update.effective_user
-    draft_id = ctx.user_data.get("schedule_draft_id") or ctx.user_data.get("repeat_draft_id")
     if not draft_id:
         await msg.reply_text("No draft selected.")
+        await db.set_flow(user.id, None)
         return
     draft = await db.get_draft(draft_id, user.id)
     if not draft:
         await msg.reply_text("Draft not found.")
+        await db.set_flow(user.id, None)
         return
     dest_ids = _dest_ids_from_draft(draft)
     targets = []
@@ -1038,6 +1052,7 @@ async def _create_scheduled_campaign(
             targets.append({"destination_id": did, "target_chat_id": d["chat_id"]})
     if not targets:
         await msg.reply_text("No valid destinations.")
+        await db.set_flow(user.id, None)
         return
 
     msg_json = draft["source_message_json"]
@@ -1067,23 +1082,18 @@ async def _create_scheduled_campaign(
         end_at=end_at,
     )
     await db.delete_draft(draft_id, user.id)
-    ctx.user_data.pop("flow", None)
-    ctx.user_data.pop("schedule_draft_id", None)
-    ctx.user_data.pop("repeat_draft_id", None)
-    ctx.user_data.pop("repeat_start_dt", None)
-    ctx.user_data.pop("repeat_seconds", None)
+    await db.set_flow(user.id, None)
 
     label = "scheduled" if not repeat_seconds else f"repeating every {repeat_seconds}s"
     await msg.reply_text(
-        f"✅ Campaign <b>#{campaign_id}</b> {label}.\n"
-        f"First run: {fmt_dt(start_dt)}",
+        f"✅ Campaign <b>#{campaign_id}</b> {label}.\nFirst run: {fmt_dt(start_dt)}",
         parse_mode=ParseMode.HTML,
         reply_markup=kb([[btn("🏠 Main menu", "menu:home")]]),
     )
 
 
 # ---------------------------------------------------------------------------
-# Drafts list
+# Drafts, scheduled, repeating lists
 # ---------------------------------------------------------------------------
 
 async def _show_drafts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1105,10 +1115,6 @@ async def _show_drafts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.effective_message.reply_text(txt, reply_markup=markup, parse_mode=ParseMode.HTML)
 
-
-# ---------------------------------------------------------------------------
-# Scheduled / repeating lists
-# ---------------------------------------------------------------------------
 
 async def _show_scheduled(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = ctx.application.bot_data["db"]
@@ -1360,7 +1366,8 @@ async def on_settings_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await q.answer()
     action = q.data.split(":", 1)[1]
     if action == "tz":
-        ctx.user_data["flow"] = "settings_tz"
+        db: Database = ctx.application.bot_data["db"]
+        await db.set_flow(update.effective_user.id, "settings_tz")
         await q.edit_message_text(
             "Send the new timezone (e.g. <code>Europe/London</code>, <code>Asia/Kolkata</code>).",
             parse_mode=ParseMode.HTML,
@@ -1526,7 +1533,7 @@ async def on_adm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
     elif action == "bcall":
-        ctx.user_data["admin_flow"] = "broadcast_all"
+        await db.set_flow(update.effective_user.id, "admin_broadcast_all")
         await q.edit_message_text(
             "Send the text you want broadcast to all users.",
             reply_markup=kb([[btn("✖️ Cancel", "adm:home")]]),
@@ -1555,6 +1562,7 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def register(app, cfg: Config) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("register", cmd_register_in_group))
@@ -1596,14 +1604,14 @@ def register(app, cfg: Config) -> None:
     # Admin
     app.add_handler(CallbackQueryHandler(on_adm, pattern=r"^adm:"))
 
+    # Content handler FIRST (catches everything not commands)
+    app.add_handler(MessageHandler(~filters.COMMAND, on_content_message))
+
     # Text inputs (schedule, repeat, timezone)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input))
 
-    # Forwarded messages → destination registration (guarded against await_content)
+    # Forward registration (guarded by flow check inside)
     app.add_handler(MessageHandler(filters.FORWARDED, on_forward_or_group_message))
-
-    # Content for broadcast (all non-command messages)
-    app.add_handler(MessageHandler(~filters.COMMAND, on_content_message))
 
     # Global error handler
     app.add_error_handler(_on_error)
