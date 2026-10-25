@@ -1,49 +1,99 @@
-# Telegram Broadcast Pro — Advanced UI & Scheduling Upgrade
+# Telegram Broadcast Pro
 
-This package replaces `handlers.py`, `database.py`, `main.py`, and `README.md` in the existing project. It retains the current `config.py`, `broadcaster.py`, `requirements.txt`, Dockerfile and Railway setup.
+Multi-user Telegram broadcasting bot with PostgreSQL persistence, scheduling,
+repeating campaigns, delivery reports, premium (custom) emoji preservation,
+and a master-admin panel.
 
-## Added
-- User-only `/help` and separate admin-only `/adminhelp`.
-- Inline user/admin dashboards and private-chat draft workflow for text, photos, videos and supported message types.
-- Schedule presets: 1 hour, 6 hours, 12 hours, tomorrow; recurring hourly/daily/weekly; custom UTC date/time and repeat interval.
-- System stats page with all registered users, paginated details, campaigns count, successful/failed delivery attempts, joined date and last active date.
-- CSV export of the full user report.
-- Admin command `/setpremiumemojis` to save Telegram custom emoji IDs from a replied-to message; `/resetpremiumemojis` restores Unicode fallbacks.
-- PostgreSQL migration adds the `premium_emojis` table automatically.
+## Features
 
-## Premium/custom emoji setup
-1. Send a message in a private chat with the bot containing your Telegram custom/premium emojis in the desired order.
-2. Reply to that message with `/setpremiumemojis`.
-3. The first custom emoji maps to Rocket, second to Broadcast, third to Calendar, then Destination, Stats, Help, Shield, User, Success, Warning, Failed, Clock, Target, Campaign, Repeat, Sparkle, Settings, Chart.
-4. The bot uses Telegram's custom-emoji HTML entity in its own message text where supported. Inline keyboard button labels remain standard text because Telegram does not provide the same entity support for button labels.
-5. Use `/resetpremiumemojis` to remove the custom IDs.
+- Multi-user with per-user isolation
+- Destination (group/channel) registration with multi-manager support
+- Broadcast composer: text, photo, video, document, audio, sticker, voice,
+  animation, media albums (individually copied), custom/premium emoji
+  (native `copy_message` preserves entities)
+- Drafts persisted in PostgreSQL
+- Send Now / Schedule / Repeat with persistent jobs
+- Delivery engine with retries, rate-limit handling, `RetryAfter`
+- Per-destination delivery results and reports
+- Admin dashboard, user management, exports to Excel
+- `/help` (user) and `/adminhelp` (admin) separated
+- Graceful shutdown, DB pool, SIGTERM handling
 
-The source message must contain actual Telegram custom-emoji entities, not regular Unicode emoji characters.
+## Quick start (local)
 
-## Scheduling
-Send the content to the bot in a private chat. Use the inline `Schedule` button and choose a preset, repeat hourly/daily/weekly, or custom time. Custom times use UTC: `YYYY-MM-DD HH:MM [INTERVAL_MINUTES]`. Existing `/schedule YYYY-MM-DDTHH:MM [INTERVAL_MINUTES]` remains supported by replying to the source message.
+```bash
+cp .env.example .env
+# edit .env with your BOT_TOKEN and DATABASE_URL
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
 
-## Admin user report
-Click **System Stats & Users** in the admin dashboard or run `/adminstats`. The report includes registered user name, username, campaign count, successful and failed message-delivery attempts, joined date, last active timestamp, pagination and CSV export. Delivery totals come from `campaign_deliveries`; campaign count is the number of campaign records owned by that user.
+## Railway deployment
 
-## Deploy
-1. Replace the four files above in the existing GitHub repository.
-2. Commit to `main`; Railway will redeploy.
-3. Confirm `BOT_TOKEN`, `DATABASE_URL`, and `ADMIN_IDS` are set in Railway. Never commit real credentials.
-4. Test `/start`, `/help`, `/adminhelp`, custom emoji setup, draft broadcast, schedule presets, and the admin user report in a private test destination before large campaigns.
+1. Push this repo to GitHub.
+2. In Railway, **New Project → Deploy from GitHub repo**.
+3. **Add a PostgreSQL plugin** to the project. Railway will set `DATABASE_URL`
+   on your service automatically (or use the “Connect” button).
+4. Set the following environment variables on your service:
+   - `BOT_TOKEN` (required)
+   - `ADMIN_IDS` (required, comma-separated Telegram user IDs)
+   - `DATABASE_URL` (auto-set by plugin, or paste manually)
+   - `TIMEZONE` (optional, e.g. `Europe/London`)
+   - `LOG_LEVEL` (optional, default `INFO`)
+5. Railway detects `Dockerfile` and builds.
+6. Check **Deploy Logs** — you should see:
+   ```
+   Database connected and schema ensured
+   Broadcast engine started with N workers
+   Scheduler started
+   Starting polling...
+   ```
+7. In Telegram, `/start` your bot.
 
-Only run one polling replica per bot token. Large campaigns should target people and destinations that expect the messages and comply with Telegram's rules and applicable law.
+> **Important:** run exactly **one** replica. The scheduler + delivery workers
+> are designed for a single process. For horizontal scale you would need an
+> external job queue (not implemented here).
 
+## Registering groups / channels
 
-## Premium custom emojis and shared destination admins
+1. Add the bot to the group/channel as **administrator**.
+2. Grant **Post Messages** (and **Edit Messages** for channels).
+3. Forward any message from that chat to the bot.
+4. The bot calls `getChat` + `getChatMember` to verify and registers it.
+5. If it was already registered by another manager, you will be told so
+   (no confusing “already registered to another account” error).
 
-- To configure custom emojis, send a message containing real Telegram custom emoji entities, then reply to that message with `/setpremiumemojis`. Ordinary Unicode emojis do not carry custom emoji IDs.
-- The bot owner needs active Telegram Premium for custom emoji icons in inline buttons, unless the bot qualifies through Telegram's Fragment additional-username path. Button custom emojis are displayed as the button's icon, not embedded inside the button label.
-- After `/register` is run by any current administrator in a group/channel, the bot syncs all current human chat administrators into the shared destination access table. Each administrator can then open the bot privately and use that group's destination.
-- Destination access is rechecked against Telegram when a campaign is queued; former/demoted admins are not allowed to broadcast.
-- Existing destination owners are retained; the old “already registered to another account” ownership block is removed for verified chat administrators.
+## Premium / custom emoji
 
+- **Native copy (`copy_message`)** preserves custom emoji entities exactly as
+  Telegram intended. This is the default `original` / `auto` mode.
+- Custom emoji entities are also **learned** into `premium_emojis` when they
+  appear in messages sent to the bot.
+- Telegram's Bot API **cannot** send custom emoji in inline keyboard button
+  text. We don't claim otherwise.
+- No promise is made that premium emoji work in every context — Telegram's own
+  API restrictions apply.
 
-## Admin targeted broadcasts
+## Delivery semantics
 
-Administrators can target **all users, all groups, all channels, or all destinations**, or manually select recipients before queuing a campaign. Reply to the source message/media with `/adminbroadcast users`, `/adminbroadcast groups`, `/adminbroadcast channels`, or `/adminbroadcast all`. Choose **Send to all** or **Select specific**. The recipient picker is paginated, supports selecting/deselecting individual entries, and requires a final confirmation before anything is queued. `MAX_CAMPAIGN_TARGETS` still applies.
+Telegram API sends and DB writes are not atomic. If the worker crashes after a
+successful send but before the DB update, the target is marked
+`uncertain` rather than blindly retried (to avoid duplicate sends). You can
+inspect uncertain targets and manually delete-and-retry if you want.
+
+## Tests
+
+```bash
+pip install pytest pytest-asyncio
+pytest tests/
+```
+
+Tests use mocked Telegram interactions.
+
+## Admin commands
+
+- `/admin` — open the admin panel (only for IDs in `ADMIN_IDS`)
+- `/adminhelp` — admin help
+
+All admin actions are logged in `admin_actions`.
