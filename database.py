@@ -660,3 +660,54 @@ class Database:
                 "failed_targets": await con.fetchval(
                     "SELECT COUNT(*) FROM campaign_targets WHERE status IN ('failed','uncertain')") or 0,
             }
+    # ---------------- User flow state ----------------
+    async def get_flow(self, user_tg: int) -> tuple[Optional[str], dict]:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT flow, data FROM user_flows WHERE user_telegram_id=$1", user_tg
+            )
+            if not row:
+                return None, {}
+            data = row["data"]
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except (ValueError, TypeError):
+                    data = {}
+            return row["flow"], (data or {})
+
+    async def set_flow(self, user_tg: int, flow: Optional[str], data: Optional[dict] = None) -> None:
+        async with self.pool.acquire() as con:
+            if flow is None:
+                await con.execute(
+                    "DELETE FROM user_flows WHERE user_telegram_id=$1", user_tg
+                )
+                return
+            await con.execute(
+                """INSERT INTO user_flows(user_telegram_id, flow, data)
+                   VALUES($1,$2,$3::jsonb)
+                   ON CONFLICT (user_telegram_id) DO UPDATE SET
+                     flow=EXCLUDED.flow, data=EXCLUDED.data, updated_at=NOW()""",
+                user_tg, flow, json.dumps(data or {}),
+            )
+
+    async def update_flow_data(self, user_tg: int, **kwargs) -> None:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT data FROM user_flows WHERE user_telegram_id=$1", user_tg
+            )
+            current = {}
+            if row and row["data"]:
+                d = row["data"]
+                if isinstance(d, str):
+                    try:
+                        current = json.loads(d)
+                    except (ValueError, TypeError):
+                        current = {}
+                elif isinstance(d, dict):
+                    current = d
+            current.update(kwargs)
+            await con.execute(
+                "UPDATE user_flows SET data=$2::jsonb, updated_at=NOW() WHERE user_telegram_id=$1",
+                user_tg, json.dumps(current),
+            )
