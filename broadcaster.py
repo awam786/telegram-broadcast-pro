@@ -1,300 +1,165 @@
+"""Delivery engine: async, rate-limited, retry-aware, idempotent-ish."""
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from typing import Any, Dict, Optional
 
-from telegram import MessageEntity
-from telegram.error import (
-    Forbidden,
-    BadRequest,
-    RetryAfter,
-    TelegramError,
-)
+from telegram import Bot
+from telegram.error import Forbidden, BadRequest, RetryAfter, TelegramError, NetworkError
 
-from config import SEND_DELAY_SECONDS
-from database import get_pool
+from config import Config
+from database import Database
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-async def campaign_worker(application) -> None:
-    """Process due campaigns stored in PostgreSQL."""
-    while True:
-        try:
-            campaign = await claim_due_campaign()
+class BroadcastEngine:
+    def __init__(self, bot: Bot, db: Database, cfg: Config) -> None:
+        self.bot = bot
+        self.db = db
+        self.cfg = cfg
+        self.queue: asyncio.Queue[int] = asyncio.Queue()
+        self._workers: list[asyncio.Task] = []
+        self._sem = asyncio.Semaphore(cfg.max_concurrent_deliveries)
+        self._stopping = False
 
-            if campaign is None:
-                await asyncio.sleep(2)
-                continue
+    async def start(self) -> None:
+        await self.db.recover_stuck_targets()
+        n = max(2, self.cfg.max_concurrent_deliveries)
+        for i in range(n):
+            self._workers.append(asyncio.create_task(self._worker(i), name=f"bc-worker-{i}"))
+        log.info("Broadcast engine started with %d workers", n)
 
-            await deliver_campaign(application, campaign)
+    async def stop(self) -> None:
+        self._stopping = True
+        for w in self._workers:
+            w.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()
 
-        except asyncio.CancelledError:
-            raise
+    async def enqueue(self, campaign_id: int) -> None:
+        await self.queue.put(campaign_id)
 
-        except Exception:
-            logger.exception("Campaign worker iteration failed")
-            await asyncio.sleep(3)
-
-
-async def claim_due_campaign():
-    """Atomically claim one due campaign so workers do not claim it twice."""
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                """
-                SELECT *
-                FROM campaigns
-                WHERE status = 'scheduled'
-                  AND scheduled_at <= NOW()
-                ORDER BY scheduled_at, id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-                """
-            )
-
-            if row is None:
-                return None
-
-            await conn.execute(
-                """
-                UPDATE campaigns
-                SET status = 'running',
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                row["id"],
-            )
-
-            return dict(row)
-
-
-def _decode_entities(value):
-    """Convert stored JSON entity data into a Python list."""
-    if not value:
-        return []
-
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (TypeError, ValueError):
-            logger.warning("Could not decode campaign entities")
-            return []
-
-    return value if isinstance(value, list) else []
-
-
-async def _send_campaign_message(bot, target_id: int, campaign: dict):
-    """
-    Send a stored Premium-emoji text version when available.
-
-    Otherwise, copy the original Telegram message. This fallback preserves
-    the original media, caption, and formatting.
-    """
-    emoji_mode = campaign.get("emoji_mode") or "original"
-    rendered_text = campaign.get("rendered_text")
-
-    # Premium-rendered text is supported for text-only campaigns.
-    # Media and caption campaigns continue to use copy_message until their
-    # corresponding rendering and media handling are implemented.
-    if emoji_mode == "premium" and rendered_text is not None:
-        entities_data = _decode_entities(
-            campaign.get("rendered_entities")
-        )
-
-        entities = [
-            MessageEntity.de_json(item, bot)
-            for item in entities_data
-            if isinstance(item, dict)
-        ]
-
-        return await bot.send_message(
-            chat_id=target_id,
-            text=rendered_text,
-            entities=entities or None,
-        )
-
-    return await bot.copy_message(
-        chat_id=target_id,
-        from_chat_id=campaign["source_chat_id"],
-        message_id=campaign["source_message_id"],
-    )
-
-
-async def deliver_campaign(application, campaign: dict) -> None:
-    """Deliver a campaign and persist success/failure statistics."""
-    pool = get_pool()
-
-    targets = list(
-        dict.fromkeys(
-            int(value) for value in campaign["target_ids"]
-        )
-    )
-
-    sent = 0
-    failed = 0
-
-    if not targets:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE campaigns
-                SET status = 'completed',
-                    total_targets = 0,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                campaign["id"],
-            )
-        return
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE campaigns
-            SET total_targets = $2,
-                updated_at = NOW()
-            WHERE id = $1
-            """,
-            campaign["id"],
-            len(targets),
-        )
-
-    for target_id in targets:
-        success = False
-        error_text = None
-
-        try:
-            await _send_campaign_message(
-                application.bot,
-                target_id,
-                campaign,
-            )
-            success = True
-            sent += 1
-
-        except RetryAfter as exc:
-            delay = float(getattr(exc, "retry_after", 1))
-            await asyncio.sleep(max(1.0, delay))
-
+    async def _worker(self, idx: int) -> None:
+        while not self._stopping:
             try:
-                await _send_campaign_message(
-                    application.bot,
-                    target_id,
-                    campaign,
-                )
-                success = True
-                sent += 1
+                cid = await self.queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._run_campaign(cid)
+            except Exception:
+                log.exception("Campaign %s crashed in worker %d", cid, idx)
+            finally:
+                self.queue.task_done()
 
-            except Exception as retry_exc:
-                failed += 1
-                error_text = str(retry_exc)[:1000]
+    async def _run_campaign(self, campaign_id: int) -> None:
+        campaign = await self.db.get_campaign(campaign_id)
+        if not campaign:
+            log.warning("Campaign %s not found", campaign_id)
+            return
+        if campaign["status"] not in ("queued", "running"):
+            log.info("Skipping campaign %s with status %s", campaign_id, campaign["status"])
+            return
 
-                if isinstance(retry_exc, Forbidden):
-                    async with pool.acquire() as conn:
-                        await conn.execute(
-                            """
-                            UPDATE destinations
-                            SET is_active = FALSE
-                            WHERE chat_id = $1
-                            """,
-                            target_id,
-                        )
+        await self.db.set_campaign_status(campaign_id, "running")
+        targets = await self.db.get_campaign_targets(campaign_id)
+        pending = [t for t in targets if t["status"] == "pending"]
+        log.info("Campaign %s: %d pending targets", campaign_id, len(pending))
 
-        except (Forbidden, BadRequest, TelegramError) as exc:
-            failed += 1
-            error_text = str(exc)[:1000]
+        for t in pending:
+            if self._stopping:
+                break
+            async with self._sem:
+                await self._deliver_one(campaign, t)
 
-            if isinstance(exc, Forbidden):
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE destinations
-                        SET is_active = FALSE
-                        WHERE chat_id = $1
-                        """,
-                        target_id,
-                    )
-
-        except Exception as exc:
-            failed += 1
-            error_text = str(exc)[:1000]
-
-            logger.warning(
-                "Campaign %s failed for target %s: %s",
-                campaign["id"],
-                target_id,
-                exc,
-            )
-
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO campaign_deliveries
-                    (campaign_id, target_chat_id, success, error_text)
-                VALUES ($1, $2, $3, $4)
-                """,
-                campaign["id"],
-                target_id,
-                success,
-                error_text,
-            )
-
-            await conn.execute(
-                """
-                UPDATE campaigns
-                SET sent_count = $2,
-                    failed_count = $3,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                campaign["id"],
-                sent,
-                failed,
-            )
-
-        if SEND_DELAY_SECONDS:
-            await asyncio.sleep(SEND_DELAY_SECONDS)
-
-    async with pool.acquire() as conn:
-        repeat_interval = campaign.get(
-            "repeat_interval_minutes"
-        )
-
-        if repeat_interval:
-            interval = int(repeat_interval)
-
-            await conn.execute(
-                """
-                UPDATE campaigns
-                SET status = 'scheduled',
-                    scheduled_at = GREATEST(
-                        scheduled_at + ($2 * INTERVAL '1 minute'),
-                        NOW() + INTERVAL '1 second'
-                    ),
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                campaign["id"],
-                interval,
-            )
+        stats = await self.db.campaign_stats(campaign_id)
+        ok = stats.get("success", 0)
+        fail = stats.get("failed", 0) + stats.get("uncertain", 0)
+        pending_left = stats.get("pending", 0) + stats.get("sending", 0)
+        if pending_left:
+            final = "paused"
+        elif fail == 0 and ok > 0:
+            final = "completed"
+        elif ok > 0:
+            final = "completed_with_errors"
         else:
-            await conn.execute(
-                """
-                UPDATE campaigns
-                SET status = 'completed',
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                campaign["id"],
-            )
+            final = "failed"
+        await self.db.set_campaign_status(campaign_id, final)
+        await self.db.bump_user_counters(campaign["user_telegram_id"], ok, fail)
+        log.info("Campaign %s finished status=%s ok=%d fail=%d", campaign_id, final, ok, fail)
 
-    logger.info(
-        "Campaign %s finished: %s sent, %s failed, %s targets",
-        campaign["id"],
-        sent,
-        failed,
-        len(targets),
-    )
+        # Notify user
+        try:
+            await self.bot.send_message(
+                campaign["user_telegram_id"],
+                f"✅ Campaign <b>#{campaign_id}</b> finished: <b>{final}</b>\n"
+                f"✔️ Success: {ok}   ❌ Failed: {fail}",
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+
+    async def _deliver_one(self, campaign: Dict[str, Any], target: Dict[str, Any]) -> None:
+        from_chat = campaign["source_chat_id"]
+        from_msg = campaign["source_message_id"]
+        target_chat = target["target_chat_id"]
+
+        for attempt in range(3):
+            try:
+                await self.db.update_target(target["id"], "sending", bump_attempt=True)
+                await self.bot.copy_message(
+                    chat_id=target_chat,
+                    from_chat_id=from_chat,
+                    message_id=from_msg,
+                )
+                await self.db.update_target(target["id"], "success", bump_attempt=False)
+                return
+            except RetryAfter as e:
+                wait = int(getattr(e, "retry_after", 5)) + 1
+                log.warning("Rate limited on target %s; sleeping %ss", target["id"], wait)
+                await asyncio.sleep(wait)
+                continue
+            except Forbidden as e:
+                await self.db.update_target(
+                    target["id"], "failed",
+                    err=f"Bot lacks permission or was removed: {e}", err_cat="forbidden",
+                )
+                await self.db.update_destination_status(target["destination_id"], "inaccessible", str(e)) \
+                    if target.get("destination_id") else None
+                return
+            except BadRequest as e:
+                s = str(e).lower()
+                if "message to copy not found" in s or "message_id_invalid" in s:
+                    await self.db.update_target(
+                        target["id"], "failed", err=str(e), err_cat="source_missing")
+                    return
+                if "chat not found" in s or "chat_invalid" in s:
+                    await self.db.update_target(
+                        target["id"], "failed", err=str(e), err_cat="chat_missing")
+                    return
+                await self.db.update_target(
+                    target["id"], "failed", err=str(e), err_cat="bad_request")
+                return
+            except NetworkError as e:
+                await asyncio.sleep(2 ** attempt)
+                if attempt == 2:
+                    await self.db.update_target(
+                        target["id"], "uncertain", err=str(e), err_cat="network")
+                continue
+            except TelegramError as e:
+                await self.db.update_target(
+                    target["id"], "failed", err=str(e), err_cat="telegram")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("Unexpected delivery error target=%s", target["id"])
+                await self.db.update_target(
+                    target["id"], "failed", err=str(e), err_cat="unknown")
+                return
+        # loop exhausted
+        await self.db.update_target(
+            target["id"], "uncertain", err="Max retries exceeded", err_cat="retry_exhausted")
