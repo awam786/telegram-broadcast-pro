@@ -49,7 +49,8 @@ def message_to_json(msg: Message) -> Dict[str, Any]:
         ],
         "media_group_id": msg.media_group_id,
     }
-    for attr in ("photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "poll"):
+    for attr in ("photo", "video", "document", "audio", "voice", "animation",
+                 "sticker", "video_note", "poll"):
         v = getattr(msg, attr, None)
         if v is not None:
             data["media_type"] = attr
@@ -58,7 +59,11 @@ def message_to_json(msg: Message) -> Dict[str, Any]:
 
 
 def summary_from_message(msg: Message, prefix: str = "") -> str:
-    base = msg.text or msg.caption or f"[{ (getattr(msg, 'photo', None) and 'photo') or (getattr(msg, 'video', None) and 'video') or (getattr(msg, 'document', None) and 'document') or 'message' }]"
+    base = (
+        msg.text
+        or msg.caption
+        or f"[{(getattr(msg, 'photo', None) and 'photo') or (getattr(msg, 'video', None) and 'video') or (getattr(msg, 'document', None) and 'document') or 'message'}]"
+    )
     return prefix + truncate(base, 80)
 
 
@@ -100,7 +105,7 @@ def parse_datetime_local(raw: str, tz_name: str) -> Optional[datetime]:
 
 
 def parse_interval(raw: str) -> Optional[int]:
-    """Parse things like '5m', '2h', '1d', or integer minutes."""
+    """Parse '5m', '2h', '1d', or integer minutes."""
     raw = raw.strip().lower()
     m = re.fullmatch(r"(\d+)\s*([smhd])?", raw)
     if not m:
