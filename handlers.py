@@ -1,6 +1,7 @@
 """All user and admin handlers for Telegram Broadcast Pro."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -12,7 +13,8 @@ from telegram import (
 from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError
 from telegram.ext import (
-    ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters,
+    ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ChatMemberHandler, filters,
 )
 
 from config import Config
@@ -112,7 +114,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>User Commands</b>\n"
         "/start — Main menu\n"
         "/help — This help\n"
-        "/register — Run inside a group/channel to register it\n\n"
+        "/register — Run inside a group/channel to register it\n"
+        "/sync — Recheck all your registered destinations\n\n"
         "<b>Registering a group or channel</b>\n"
         "1. Open the group/channel in Telegram.\n"
         "2. Administrators → Add Administrator.\n"
@@ -189,13 +192,17 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Destination registration — FIXED for PTB v21+ (uses forward_origin)
+# Destination registration
 # ---------------------------------------------------------------------------
 
 async def on_forward_or_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a forwarded message used to register a destination."""
     msg = update.effective_message
     if not msg:
+        return
+
+    # IMPORTANT: if the user is mid-broadcast, this is content, not registration.
+    if ctx.user_data.get("flow") == "await_content":
         return
 
     db: Database = ctx.application.bot_data["db"]
@@ -209,7 +216,6 @@ async def on_forward_or_group_message(update: Update, ctx: ContextTypes.DEFAULT_
         origin_chat = fo.chat
 
     if origin_chat is None:
-        # User forwards or ordinary messages — not a registerable destination.
         return
 
     await _register_destination(update, ctx, origin_chat)
@@ -233,7 +239,6 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     chat_label = chat.title or str(chat.id)
     bot_username = bot.username or "your bot"
 
-    # 1) Can the bot see the chat?
     try:
         live_chat = await bot.get_chat(chat.id)
     except TelegramError as e:
@@ -263,7 +268,6 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         )
         return
 
-    # 2) Is the bot an admin?
     try:
         member = await bot.get_chat_member(live_chat.id, bot.id)
     except TelegramError as e:
@@ -309,7 +313,6 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         )
         return
 
-    # 3) Already registered?
     existing = await db.get_destination_by_chat(live_chat.id)
     if existing:
         if await db.is_manager(existing["id"], user.id):
@@ -328,7 +331,6 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             )
         return
 
-    # 4) Register
     dest_type = "channel" if live_chat.type == ChatType.CHANNEL else (
         "supergroup" if live_chat.type == ChatType.SUPERGROUP else "group"
     )
@@ -342,8 +344,54 @@ async def _register_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     )
 
 
+async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Recheck all destinations where the bot is a member."""
+    db: Database = ctx.application.bot_data["db"]
+    user = update.effective_user
+    msg = update.effective_message
+
+    dests = await db.user_destinations(user.id)
+    if not dests:
+        await msg.reply_text("You have no registered destinations.")
+        return
+
+    ok = 0
+    lost = 0
+    no_admin = 0
+    for d in dests:
+        try:
+            member = await ctx.bot.get_chat_member(d["chat_id"], ctx.bot.id)
+            status = getattr(member, "status", "")
+            if status in ("administrator", "creator"):
+                can_post = True
+                if d["dest_type"] == "channel":
+                    can_post = bool(getattr(member, "can_post_messages", True))
+                if can_post:
+                    await db.update_destination_status(d["id"], "active", None)
+                    ok += 1
+                else:
+                    await db.update_destination_status(
+                        d["id"], "missing_permissions", "No Post Messages")
+                    no_admin += 1
+            else:
+                await db.update_destination_status(
+                    d["id"], "missing_permissions", f"Bot is {status}")
+                no_admin += 1
+        except TelegramError as e:
+            await db.update_destination_status(d["id"], "inaccessible", str(e))
+            lost += 1
+
+    await msg.reply_text(
+        f"<b>Sync complete</b>\n"
+        f"✅ OK: {ok}\n"
+        f"⚠️ Missing admin rights: {no_admin}\n"
+        f"❌ Inaccessible: {lost}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Destinations
+# Destinations list
 # ---------------------------------------------------------------------------
 
 async def _show_destinations(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int) -> None:
@@ -591,6 +639,8 @@ async def on_flow_confirm_dests(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await q.answer("Select at least one destination.", show_alert=True)
         return
     ctx.user_data["flow"] = "await_content"
+    log.info("Awaiting content from user %s, selected=%d destinations",
+             update.effective_user.id, len(sel))
     await q.edit_message_text(
         "<b>Step 2/4 — Send your content</b>\n\n"
         "Now <b>send or forward the message</b> you want to broadcast. It can be text, "
@@ -613,17 +663,38 @@ async def on_flow_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """User sent the message we should broadcast (only when awaiting)."""
-    if ctx.user_data.get("flow") != "await_content":
+    flow = ctx.user_data.get("flow")
+    log.info("on_content_message: user=%s flow=%s",
+             update.effective_user.id if update.effective_user else None, flow)
+    if flow != "await_content":
         return
+
     db: Database = ctx.application.bot_data["db"]
     emoji: EmojiManager = ctx.application.bot_data["emoji"]
     msg = update.effective_message
     user = update.effective_user
 
-    sel = ctx.user_data.get("selected_destinations", set())
-    if not sel:
-        await msg.reply_text("No destinations selected.")
+    if not msg or not user:
         return
+
+    replace_draft_id = ctx.user_data.get("replace_draft_id")
+
+    if replace_draft_id:
+        old = await db.get_draft(replace_draft_id, user.id)
+        if not old:
+            await msg.reply_text("Original draft not found. Please start a new broadcast.")
+            ctx.user_data.pop("flow", None)
+            ctx.user_data.pop("replace_draft_id", None)
+            return
+        sel = old.get("selected_destinations") or []
+        await db.delete_draft(replace_draft_id, user.id)
+        ctx.user_data.pop("replace_draft_id", None)
+    else:
+        sel = ctx.user_data.get("selected_destinations", set())
+        if not sel:
+            await msg.reply_text("No destinations selected. Please start again.")
+            return
+        sel = list(sel)
 
     try:
         ents = msg.entities or msg.caption_entities or []
@@ -631,14 +702,20 @@ async def on_content_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         log.exception("Emoji learning failed")
 
-    draft_id = await db.create_draft(
-        user_tg=user.id,
-        source_chat_id=msg.chat_id,
-        source_message_id=msg.message_id,
-        message_json=message_to_json(msg),
-        emoji_mode="auto",
-    )
-    await db.update_draft_selection(draft_id, user.id, list(sel))
+    try:
+        draft_id = await db.create_draft(
+            user_tg=user.id,
+            source_chat_id=msg.chat_id,
+            source_message_id=msg.message_id,
+            message_json=message_to_json(msg),
+            emoji_mode="auto",
+        )
+        await db.update_draft_selection(draft_id, user.id, list(sel))
+    except Exception:
+        log.exception("Failed to create draft")
+        await msg.reply_text("⚠️ Failed to save draft. Please try again.")
+        return
+
     ctx.user_data["draft_id"] = draft_id
     ctx.user_data["flow"] = "draft_options"
 
@@ -804,10 +881,9 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await q.edit_message_text("No valid destinations.")
         return
 
-    import json as _json
     msg_json = draft["source_message_json"]
     if isinstance(msg_json, str):
-        msg_json = _json.loads(msg_json)
+        msg_json = json.loads(msg_json)
 
     campaign_id = await db.create_campaign(
         user_tg=update.effective_user.id,
@@ -840,6 +916,8 @@ async def on_drf_do_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 async def on_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     flow = ctx.user_data.get("flow")
     if not flow:
+        return
+    if flow == "await_content":
         return
     msg = update.effective_message
     db: Database = ctx.application.bot_data["db"]
@@ -930,10 +1008,9 @@ async def _create_scheduled_campaign(
         await msg.reply_text("No valid destinations.")
         return
 
-    import json as _json
     msg_json = draft["source_message_json"]
     if isinstance(msg_json, str):
-        msg_json = _json.loads(msg_json)
+        msg_json = json.loads(msg_json)
 
     campaign_id = await db.create_campaign(
         user_tg=user.id,
@@ -1446,6 +1523,7 @@ def register(app, cfg: Config) -> None:
     app.add_handler(CommandHandler("adminhelp", cmd_adminhelp))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("register", cmd_register_in_group))
+    app.add_handler(CommandHandler("sync", cmd_sync))
 
     # Menu
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
@@ -1483,14 +1561,14 @@ def register(app, cfg: Config) -> None:
     # Admin
     app.add_handler(CallbackQueryHandler(on_adm, pattern=r"^adm:"))
 
-    # Text inputs (must come after callback handlers)
+    # Text inputs (schedule, repeat, timezone)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input))
 
-    # Forwarded messages → destination registration
+    # Forwarded messages → destination registration (guarded against await_content)
     app.add_handler(MessageHandler(filters.FORWARDED, on_forward_or_group_message))
 
-    # Ordinary content (images, videos, etc.) in broadcast flows
+    # Content for broadcast (all non-command messages)
     app.add_handler(MessageHandler(~filters.COMMAND, on_content_message))
 
-    # Global error handler (must be last)
+    # Global error handler
     app.add_error_handler(_on_error)
